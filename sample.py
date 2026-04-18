@@ -48,8 +48,9 @@ def _model_config_for_size(model_size):
         depth=variant["depth"],
         num_heads=variant["num_heads"],
         mlp_ratio=4.0,
-        num_classes=1001,
-        learn_sigma=True,
+        num_classes=1000,   # ImageNet: 1000 class thật; null class = 1000 khi dùng CFG
+        learn_sigma=False,  # Khớp với SiT-SRA gốc
+        class_dropout_prob=0.0,  # Sampling: không drop label
         compatibility_mode=True,
     )
 
@@ -172,7 +173,8 @@ def build_sample_step(model, vae, scale_factor, shift_factor):
             cfg_scale=cfg_scale,
             guidance_low=guidance_low,
             guidance_high=guidance_high,
-            mode="SDE",
+            mode="ODE",         # Euler ODE: khớp với euler_sampler của SiT-SRA gốc
+            sampling_method="euler",
             reverse=False,
         )
         
@@ -219,7 +221,7 @@ def main():
                         help="HuggingFace VAE model ID")
     parser.add_argument("--cfg-scale", type=float, default=1.0, help="CFG scale (1.0 = no guidance)")
     parser.add_argument("--guidance-low", type=float, default=0.0, help="Lower guidance bound")
-    parser.add_argument("--guidance-high", type=float, default=0.7, help="Upper guidance bound")
+    parser.add_argument("--guidance-high", type=float, default=1.0, help="Upper guidance bound")
     args = parser.parse_args()
     
     print(f"Generating {args.num_fid_samples} samples")

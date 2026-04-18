@@ -118,7 +118,19 @@ def main():
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size for VAE encoding")
     parser.add_argument("--num-shards", type=int, default=1024, help="Number of .ar shards (use more for train, less for val)")
     parser.add_argument("--vae-model", type=str, default="stabilityai/sd-vae-ft-ema", help="HuggingFace Hub VAE path")
-    
+    parser.add_argument(
+        "--save-moments",
+        action="store_true",
+        default=True,
+        help=(
+            "Lưu VAE moments (mean + std, shape 8×32×32) thay vì latent cố định (4×32×32). "
+            "KHUYẾN NGHỊ: moments cho phép train.py sample posterior mỗi batch → "
+            "stochasticity tốt hơn, khớp với SiT-SRA PyTorch gốc. "
+            "Dùng --no-save-moments nếu muốn lưu latent cố định (format cũ)."
+        ),
+    )
+    parser.add_argument("--no-save-moments", dest="save_moments", action="store_false")
+
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     
@@ -152,26 +164,52 @@ def main():
     writer = get_writer(current_shard)
     
     for images, labels in tqdm(dataloader, desc=f"Encoding {args.split}"):
-        
+
         # Move images to GPU and FP16 to match VAE
         images = images.to(device, dtype=torch.float16)
-        
+
         # Encode with VAE
-        # using sample() gives the latents, applying scale right now.
         latent_dist = vae.encode(images).latent_dist
-        latents = latent_dist.sample() * SCALE_FACTOR
-        
-        # Move latents back to CPU as Float32 numpy arrays for serialization
-        latents_np = latents.cpu().to(torch.float32).numpy()
         labels_np = labels.cpu().numpy()
-        
+
+        if args.save_moments:
+            # Lưu moments (mean + std) để train.py có thể sample posterior mỗi batch.
+            # Đây là cách của SiT-SRA PyTorch gốc: mỗi iteration dùng latent ngẫu nhiên
+            # z = mean + std * N(0,1), giúp model học phân bố rộng hơn và tổng quát hóa tốt hơn.
+            # mean: (N, 4, 32, 32), std = exp(0.5 * logvar): (N, 4, 32, 32)
+            mean_np = latent_dist.mean.cpu().to(torch.float32).numpy()   # (N, 4, 32, 32)
+            std_np = latent_dist.std.cpu().to(torch.float32).numpy()     # (N, 4, 32, 32)
+            # Ghép thành moments shape (N, 8, 32, 32) — không scale ở đây,
+            # scale_factor (0.18215) sẽ được áp dụng trong train.py khi sample.
+            moments_np = np.concatenate([mean_np, std_np], axis=1)
+
+            for moments, label in zip(moments_np, labels_np):
+                payload = {
+                    "moments": moments,  # Shape (8, 32, 32): first 4 = mean, last 4 = std
+                    "label": label
+                }
+                serialized = pickle.dumps(payload)
+                writer.write(serialized)
+                samples_in_current_shard += 1
+                if samples_in_current_shard >= samples_per_shard:
+                    writer.close()
+                    current_shard += 1
+                    if current_shard < args.num_shards:
+                        writer = get_writer(current_shard)
+                        samples_in_current_shard = 0
+            continue  # skip the latent-mode block below
+
+        # --- Chế độ cũ: lưu latent cố định (không khuyến nghị cho training) ---
+        latents = latent_dist.sample() * SCALE_FACTOR
+        latents_np = latents.cpu().to(torch.float32).numpy()
+
         # Iterate over batch and write each single record iteratively
         for latent, label in zip(latents_np, labels_np):
-            
+
             # Serialize payload natively (Pickle is simple and fast for Grain reading later)
             payload = {
-                "latent": latent, # Shape (4, 32, 32)
-                "label": label    # Int
+                "latent": latent,  # Shape (4, 32, 32) — latent cố định
+                "label": label
             }
             serialized = pickle.dumps(payload)
             writer.write(serialized)

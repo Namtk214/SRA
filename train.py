@@ -385,8 +385,9 @@ def build_model_config(model_size):
         depth=variant["depth"],
         num_heads=variant["num_heads"],
         mlp_ratio=4.0,
-        num_classes=1001,
-        learn_sigma=True,
+        num_classes=1000,   # ImageNet: 1000 class thật (0-999); null class = 1000 khi dùng CFG
+        learn_sigma=False,  # Khớp với SiT-SRA gốc (không dùng learn_sigma)
+        cfg_prob=0.1,       # Xác suất drop label cho CFG training (khớp với SiT-SRA gốc)
         compatibility_mode=True,
     )
 
@@ -448,6 +449,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         mlp_ratio=config["mlp_ratio"],
         num_classes=config["num_classes"],
         learn_sigma=config["learn_sigma"],
+        class_dropout_prob=config.get("cfg_prob", 0.0),  # CFG training (0.1 = khớp SiT-SRA gốc)
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
     )
@@ -746,21 +748,48 @@ def get_arrayrecord_dataloader(data_pattern, batch_size, is_training=True, seed=
     input_paths = resolve_arrayrecord_paths(data_pattern)
     data_source = grain.ArrayRecordDataSource(input_paths)
 
+    # scale_factor của SD-VAE (sd-vae-ft-ema / sd-vae-ft-mse đều dùng 0.18215)
+    _SCALE_FACTOR = np.float32(0.18215)
+
     class ParseAndTokenizeLatents(grain.MapTransform):
+        """Đọc record từ ArrayRecord, sample posterior nếu có moments, rồi patchify.
+
+        Hỗ trợ hai format:
+        - Mới (KHUYẾN NGHỊ): {"moments": (8,32,32), "label": int}
+            moments[:4] = mean, moments[4:] = std (chưa scale).
+            → Sample z = mean + std * N(0,1), sau đó × scale_factor.
+            → Khớp với SiT-SRA PyTorch gốc: mỗi iteration có latent ngẫu nhiên
+              khác nhau từ cùng một ảnh, giúp model tổng quát hóa tốt hơn.
+        - Cũ (backward compat): {"latent": (4,32,32), "label": int}
+            → Dùng latent cố định (không sample_posterior).
+            → Stochasticity kém hơn, nhưng vẫn hoạt động được.
+
+        Để dùng format mới, re-encode bằng prepare_data.py hoặc
+        prepare_data_tpu.py với flag --save-moments (mặc định bật).
+        """
         def map(self, record_bytes):
             parsed = pickle.loads(record_bytes)
-
-            latent = parsed["latent"] # numpy array shape: (4, 32, 32)
             label = parsed["label"]
 
-            # Patchify the latent to DiT input (256, 16)
+            if "moments" in parsed:
+                # Format mới: sample từ VAE posterior mỗi batch
+                # → stochasticity như SiT-SRA PyTorch gốc
+                moments = parsed["moments"]    # (8, 32, 32): mean[0:4] + std[4:8]
+                mean = moments[:4]             # (4, 32, 32)
+                std  = moments[4:]             # (4, 32, 32)
+                noise = np.random.randn(*mean.shape).astype(np.float32)
+                latent = (mean + std * noise) * _SCALE_FACTOR  # (4, 32, 32)
+            else:
+                # Format cũ: latent cố định (không sample_posterior)
+                latent = parsed["latent"]      # (4, 32, 32)
+
+            # Patchify latent → DiT token sequence
+            # Tương đương: rearrange "b c (h p1) (w p2) -> b (h w) (p1 p2 c)"
             c, h, w = latent.shape
             p = 2
-
-            # Using numpy to manipulate shapes to send cleanly into DataLoader
             latent = np.reshape(latent, (c, h // p, p, w // p, p))
-            latent = np.transpose(latent, (1, 3, 2, 4, 0)) # block arrangement
-            latent = np.reshape(latent, ((h // p) * (w // p), p * p * c))
+            latent = np.transpose(latent, (1, 3, 2, 4, 0))  # (h//p, w//p, p, p, c)
+            latent = np.reshape(latent, ((h // p) * (w // p), p * p * c))  # (N_tokens, p*p*c)
 
             return latent, label
 
@@ -877,6 +906,7 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         mlp_ratio=config["mlp_ratio"],
         num_classes=config["num_classes"],
         learn_sigma=config["learn_sigma"],
+        class_dropout_prob=0.0,  # sampling: không drop label (deterministic)
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
     )
@@ -912,7 +942,8 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         if use_cfg:
             x = jnp.concatenate([x, x], axis=0)
             class_labels = jnp.concatenate(
-                [jnp.full_like(class_labels, config["num_classes"] - 1), class_labels],
+                # null class = num_classes (index sau các class thật 0..num_classes-1)
+                [jnp.full_like(class_labels, config["num_classes"]), class_labels],
                 axis=0,
             )
 
@@ -933,9 +964,10 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
             num_steps=num_steps,
             cfg_scale=cfg_scale,
             guidance_low=0.0,
-            guidance_high=0.7,
-            mode="SDE",
-            reverse=False,   # training: tau=0→noise, tau=1→data → integrate forward
+            guidance_high=1.0,
+            mode="ODE",         # Euler ODE: khớp với euler_sampler của SiT-SRA gốc
+            sampling_method="euler",
+            reverse=False,      # tau: 0→noise, 1→data → integrate forward
         )
 
         if use_cfg:
@@ -976,6 +1008,7 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         mlp_ratio=config["mlp_ratio"],
         num_classes=config["num_classes"],
         learn_sigma=config["learn_sigma"],
+        class_dropout_prob=0.0,  # sampling: không drop label (deterministic)
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
     )
@@ -1007,7 +1040,8 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         if use_cfg:
             x = jnp.concatenate([x, x], axis=0)
             class_labels_local = jnp.concatenate(
-                [jnp.full_like(class_labels_local, config["num_classes"] - 1), class_labels_local],
+                # null class = num_classes (index sau các class thật 0..num_classes-1)
+                [jnp.full_like(class_labels_local, config["num_classes"]), class_labels_local],
                 axis=0,
             )
 
@@ -1028,8 +1062,9 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
             num_steps=num_steps,
             cfg_scale=cfg_scale,
             guidance_low=0.0,
-            guidance_high=0.7,
-            mode="SDE",
+            guidance_high=1.0,
+            mode="ODE",         # Euler ODE: khớp với euler_sampler của SiT-SRA gốc
+            sampling_method="euler",
             reverse=False,
         )
 
@@ -1213,6 +1248,16 @@ def main():
     )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
+    parser.add_argument(
+        "--cfg-prob",
+        type=float,
+        default=0.1,
+        help=(
+            "Xác suất drop label để train classifier-free guidance (CFG). "
+            "0.0 = không train CFG. 0.1 = khớp SiT-SRA gốc (mặc định). "
+            "Chú ý: sample với cfg_scale>1 chỉ hoạt động đúng khi cfg_prob>0."
+        ),
+    )
     parser.add_argument(
         "--loss-type",
         type=str,
@@ -1413,6 +1458,8 @@ def main():
 
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size)
+    # Override cfg_prob từ command line (args.cfg_prob override giá trị default trong config)
+    config["cfg_prob"] = args.cfg_prob
     depth = int(config["depth"])
 
     log_stage(

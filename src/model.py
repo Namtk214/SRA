@@ -1,8 +1,18 @@
 """
 Self-Flow Model (Flax version).
 
-This module contains the SelfFlowPerTokenDiT model, a Diffusion Transformer
-with per-token timestep conditioning for Self-Flow training, implemented in Flax.
+Port của SiT-SRA (PyTorch) sang JAX/Flax với các fix về initialization,
+CFG training, và quy ước timestep/output để match với bản gốc.
+
+Các thay đổi so với bản trước:
+- Initialization khớp với SiT-SRA gốc:
+    + glorot_uniform cho tất cả Dense (thay vì lecun_normal mặc định)
+    + normal(std=0.02) cho TimestepEmbedder và LabelEmbedder
+    + zero-init adaLN modulation (mỗi DiTBlock và FinalLayer)
+    + zero-init FinalLayer output Dense
+- Thêm class_dropout_prob vào SelfFlowDiT → LabelEmbedder (CFG training)
+- Sửa _shufflechannel: chỉ hoạt động khi learn_sigma=True, không áp dụng khi False
+- Loại bỏ dead code trong _shufflechannel
 """
 
 import math
@@ -55,7 +65,14 @@ class PatchedPatchEmbed(nn.Module):
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
-        return nn.Dense(self.embed_dim, use_bias=self.bias, name="proj")(x)
+        # Xavier uniform khớp với nn.Linear xavier_uniform_ trong PyTorch SiT-SRA
+        return nn.Dense(
+            self.embed_dim,
+            use_bias=self.bias,
+            kernel_init=nn.initializers.glorot_uniform(),
+            bias_init=nn.initializers.zeros,
+            name="proj",
+        )(x)
 
 
 def modulate(x, shift, scale):
@@ -69,7 +86,10 @@ def modulate_per_token(x, shift, scale):
 
 
 class TimestepEmbedder(nn.Module):
-    """Embeds scalar timesteps into vector representations."""
+    """Embeds scalar timesteps into vector representations.
+
+    Init: normal(std=0.02) cho cả hai Dense, khớp với SiT-SRA gốc.
+    """
     hidden_size: int
     frequency_embedding_size: int = 256
 
@@ -86,14 +106,27 @@ class TimestepEmbedder(nn.Module):
     @nn.compact
     def __call__(self, t):
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        x = nn.Dense(self.hidden_size)(t_freq)
+        # normal(std=0.02) khớp với SiT-SRA initialize_weights
+        x = nn.Dense(
+            self.hidden_size,
+            kernel_init=nn.initializers.normal(stddev=0.02),
+            bias_init=nn.initializers.zeros,
+        )(t_freq)
         x = nn.swish(x)
-        x = nn.Dense(self.hidden_size)(x)
+        x = nn.Dense(
+            self.hidden_size,
+            kernel_init=nn.initializers.normal(stddev=0.02),
+            bias_init=nn.initializers.zeros,
+        )(x)
         return x
 
 
 class LabelEmbedder(nn.Module):
-    """Embeds class labels into vector representations."""
+    """Embeds class labels into vector representations.
+
+    Init: normal(std=0.02) cho embedding table, khớp với SiT-SRA gốc.
+    Hỗ trợ label dropout cho classifier-free guidance training.
+    """
     num_classes: int
     hidden_size: int
     dropout_prob: float
@@ -102,8 +135,10 @@ class LabelEmbedder(nn.Module):
     def __call__(self, labels, deterministic: bool = True, force_drop_ids=None):
         use_cfg_embedding = self.dropout_prob > 0
         embedding_table = nn.Embed(
-            num_embeddings=self.num_classes + use_cfg_embedding, 
-            features=self.hidden_size
+            num_embeddings=self.num_classes + use_cfg_embedding,
+            features=self.hidden_size,
+            # normal(std=0.02) khớp với SiT-SRA initialize_weights
+            embedding_init=nn.initializers.normal(stddev=0.02),
         )
 
         use_dropout = self.dropout_prob > 0
@@ -113,13 +148,21 @@ class LabelEmbedder(nn.Module):
                 drop_ids = jax.random.uniform(rng, labels.shape) < self.dropout_prob
             else:
                 drop_ids = force_drop_ids == 1
+            # null class index = num_classes (sau các class thật 0..num_classes-1)
             labels = jnp.where(drop_ids, self.num_classes, labels)
 
         return embedding_table(labels)
 
 
 class DiTBlock(nn.Module):
-    """A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning."""
+    """A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
+
+    Init:
+    - adaLN_modulation Dense: zero-init (weight=0, bias=0) → block bắt đầu
+      như identity, training ổn định hơn (khớp với SiT-SRA gốc).
+    - MLP Dense layers: glorot_uniform (xavier uniform).
+    - Attention: Flax default (glorot_uniform cho query/key/value/out).
+    """
     hidden_size: int
     num_heads: int
     mlp_ratio: float = 4.0
@@ -130,57 +173,88 @@ class DiTBlock(nn.Module):
         norm1 = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)
         norm2 = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)
         mlp_hidden_dim = int(self.hidden_size * self.mlp_ratio)
-        
+
         if self.per_token:
             batch_size, seq_len, hidden_dim = c.shape
             c_flat = c.reshape(-1, hidden_dim)
-            modulation_flat = nn.Sequential([
-                nn.swish,
-                nn.Dense(6 * self.hidden_size)
-            ])(c_flat)
+            # zero-init adaLN modulation: block bắt đầu như identity transformation
+            c_act = jax.nn.silu(c_flat)
+            modulation_flat = nn.Dense(
+                6 * self.hidden_size,
+                kernel_init=nn.initializers.zeros,
+                bias_init=nn.initializers.zeros,
+                name="adaLN_modulation",
+            )(c_act)
             modulation = modulation_flat.reshape(batch_size, seq_len, -1)
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(modulation, 6, axis=-1)
-            
+
             x_norm = modulate_per_token(norm1(x), shift_msa, scale_msa)
-            # Self Attention
             attn = nn.MultiHeadDotProductAttention(
                 num_heads=self.num_heads, qkv_features=self.hidden_size, out_features=self.hidden_size
             )(x_norm, x_norm)
             x = x + gate_msa * attn
-            
+
             x_norm2 = modulate_per_token(norm2(x), shift_mlp, scale_mlp)
-            mlp_fn = nn.Sequential([
-                nn.Dense(mlp_hidden_dim),
-                lambda z: nn.gelu(z, approximate=True),
-                nn.Dense(self.hidden_size)
-            ])
-            x = x + gate_mlp * mlp_fn(x_norm2)
+            # glorot_uniform cho MLP (khớp với xavier_uniform_ trong PyTorch)
+            mlp_h = nn.Dense(
+                mlp_hidden_dim,
+                kernel_init=nn.initializers.glorot_uniform(),
+                bias_init=nn.initializers.zeros,
+                name="mlp_fc1",
+            )(x_norm2)
+            mlp_h = jax.nn.gelu(mlp_h, approximate=True)
+            mlp_h = nn.Dense(
+                self.hidden_size,
+                kernel_init=nn.initializers.glorot_uniform(),
+                bias_init=nn.initializers.zeros,
+                name="mlp_fc2",
+            )(mlp_h)
+            x = x + gate_mlp * mlp_h
         else:
-            modulation = nn.Sequential([
-                nn.swish,
-                nn.Dense(6 * self.hidden_size)
-            ])(c)
+            # zero-init adaLN modulation
+            c_act = jax.nn.silu(c)
+            modulation = nn.Dense(
+                6 * self.hidden_size,
+                kernel_init=nn.initializers.zeros,
+                bias_init=nn.initializers.zeros,
+                name="adaLN_modulation",
+            )(c_act)
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(modulation, 6, axis=1)
-            
+
             x_norm = modulate(norm1(x), shift_msa, scale_msa)
             attn = nn.MultiHeadDotProductAttention(
                 num_heads=self.num_heads, qkv_features=self.hidden_size, out_features=self.hidden_size
             )(x_norm, x_norm)
             x = x + gate_msa[:, None, :] * attn
-            
+
             x_norm2 = modulate(norm2(x), shift_mlp, scale_mlp)
-            mlp_fn = nn.Sequential([
-                nn.Dense(mlp_hidden_dim),
-                lambda z: nn.gelu(z, approximate=True),
-                nn.Dense(self.hidden_size)
-            ])
-            x = x + gate_mlp[:, None, :] * mlp_fn(x_norm2)
-            
+            # glorot_uniform cho MLP
+            mlp_h = nn.Dense(
+                mlp_hidden_dim,
+                kernel_init=nn.initializers.glorot_uniform(),
+                bias_init=nn.initializers.zeros,
+                name="mlp_fc1",
+            )(x_norm2)
+            mlp_h = jax.nn.gelu(mlp_h, approximate=True)
+            mlp_h = nn.Dense(
+                self.hidden_size,
+                kernel_init=nn.initializers.glorot_uniform(),
+                bias_init=nn.initializers.zeros,
+                name="mlp_fc2",
+            )(mlp_h)
+            x = x + gate_mlp[:, None, :] * mlp_h
+
         return x
 
 
 class FinalLayer(nn.Module):
-    """The final layer of DiT."""
+    """The final layer of DiT.
+
+    Init:
+    - adaLN_modulation Dense: zero-init (khớp với SiT-SRA gốc).
+    - Output projection Dense: zero-init (khớp với SiT-SRA gốc).
+    Cả hai zero-init đảm bảo model bắt đầu với prediction = 0, training ổn định.
+    """
     hidden_size: int
     patch_size: int
     out_channels: int
@@ -189,48 +263,89 @@ class FinalLayer(nn.Module):
     @nn.compact
     def __call__(self, x, c):
         norm_final = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)
-        linear = nn.Dense(self.patch_size * self.patch_size * self.out_channels)
-        
+
         if self.per_token:
             batch_size, seq_len, hidden_dim = c.shape
             c_flat = c.reshape(-1, hidden_dim)
-            modulation_flat = nn.Sequential([
-                nn.swish,
-                nn.Dense(2 * self.hidden_size)
-            ])(c_flat)
+            c_act = jax.nn.silu(c_flat)
+            modulation_flat = nn.Dense(
+                2 * self.hidden_size,
+                kernel_init=nn.initializers.zeros,
+                bias_init=nn.initializers.zeros,
+                name="adaLN_modulation",
+            )(c_act)
             modulation = modulation_flat.reshape(batch_size, seq_len, -1)
             shift, scale = jnp.split(modulation, 2, axis=-1)
-            
+
             x = modulate_per_token(norm_final(x), shift, scale)
-            x = linear(x)
+            x = nn.Dense(
+                self.patch_size * self.patch_size * self.out_channels,
+                kernel_init=nn.initializers.zeros,
+                bias_init=nn.initializers.zeros,
+                name="proj",
+            )(x)
         else:
-            modulation = nn.Sequential([
-                nn.swish,
-                nn.Dense(2 * self.hidden_size)
-            ])(c)
+            c_act = jax.nn.silu(c)
+            modulation = nn.Dense(
+                2 * self.hidden_size,
+                kernel_init=nn.initializers.zeros,
+                bias_init=nn.initializers.zeros,
+                name="adaLN_modulation",
+            )(c_act)
             shift, scale = jnp.split(modulation, 2, axis=1)
-            
+
             x = modulate(norm_final(x), shift, scale)
-            x = linear(x)
-            
+            x = nn.Dense(
+                self.patch_size * self.patch_size * self.out_channels,
+                kernel_init=nn.initializers.zeros,
+                bias_init=nn.initializers.zeros,
+                name="proj",
+            )(x)
+
         return x
 
 
 class SimpleHead(nn.Module):
-    """Simple projection head for self-distillation."""
+    """Simple projection head for self-distillation (SRA student features).
+
+    Dùng glorot_uniform cho các Dense layer.
+    """
     in_dim: int
     out_dim: int
 
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(self.in_dim + self.out_dim)(x)
+        x = nn.Dense(
+            self.in_dim + self.out_dim,
+            kernel_init=nn.initializers.glorot_uniform(),
+            bias_init=nn.initializers.zeros,
+        )(x)
         x = nn.swish(x)
-        x = nn.Dense(self.out_dim)(x)
+        x = nn.Dense(
+            self.out_dim,
+            kernel_init=nn.initializers.glorot_uniform(),
+            bias_init=nn.initializers.zeros,
+        )(x)
         return x
 
 
 class SelfFlowDiT(nn.Module):
-    """Base Self-Flow DiT model."""
+    """Base Self-Flow DiT model.
+
+    Initialization khớp với SiT-SRA gốc:
+    - PatchEmbed proj: glorot_uniform
+    - TimestepEmbedder: normal(0.02)
+    - LabelEmbedder: normal(0.02)
+    - DiTBlock adaLN: zero-init
+    - FinalLayer adaLN + proj: zero-init
+
+    Parameters
+    ----------
+    class_dropout_prob : float
+        Xác suất drop label để train CFG (classifier-free guidance).
+        0.0 = không train CFG (mặc định, tương thích backward).
+        0.1 = CFG training như SiT-SRA gốc.
+    """
     input_size: int = 32
     patch_size: int = 2
     in_channels: int = 4
@@ -240,6 +355,7 @@ class SelfFlowDiT(nn.Module):
     mlp_ratio: float = 4.0
     num_classes: int = 1000
     learn_sigma: bool = False
+    class_dropout_prob: float = 0.0
     compatibility_mode: bool = False
     per_token: bool = False
 
@@ -247,9 +363,9 @@ class SelfFlowDiT(nn.Module):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
         self.grid_size = self.input_size // self.patch_size
         self.num_patches = self.grid_size * self.grid_size
-        
+
         pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.grid_size)
-        self.pos_embed_val = pos_embed[None, ...] # (1, num_patches, hidden_size)
+        self.pos_embed_val = pos_embed[None, ...]  # (1, num_patches, hidden_size)
         self.feature_head = SimpleHead(in_dim=self.hidden_size, out_dim=self.hidden_size)
 
     @nn.compact
@@ -264,25 +380,34 @@ class SelfFlowDiT(nn.Module):
         return_block_summaries: bool = False,
         deterministic: bool = True,
     ):
-        """Forward pass with compatibility mode handling."""
-        assert not (return_raw_features and return_features)
-        # return_block_summaries can be combined with either mode; callers must
-        # handle the expanded return tuple shape.
+        """Forward pass.
 
-        # PyTorch implementation explicitly negates timesteps
+        Quy ước timestep:
+        - Input timesteps: tau ∈ [0,1] với tau=0=noise, tau=1=data (JAX convention).
+        - Bên trong model: flip thành 1-tau để match convention PyTorch gốc (t=0=data, t=1=noise).
+        - Output: negate để convert từ (x1-x0) PyTorch prediction sang (x0-x1) JAX training target.
+        """
+        assert not (return_raw_features and return_features)
+
+        # Flip timestep convention: JAX tau → PyTorch t = 1 - tau
         timesteps = 1.0 - timesteps
 
-        # Patch Embedding
+        # Patch Embedding (glorot_uniform init)
         x = PatchedPatchEmbed(
-            img_size=self.input_size, 
-            patch_size=self.patch_size, 
-            in_channels=self.in_channels, 
-            embed_dim=self.hidden_size
+            img_size=self.input_size,
+            patch_size=self.patch_size,
+            in_channels=self.in_channels,
+            embed_dim=self.hidden_size,
         )(x)
         x = x + self.pos_embed_val
 
+        # Timestep + class conditioning
         t_embedder = TimestepEmbedder(hidden_size=self.hidden_size)
-        y_embedder = LabelEmbedder(num_classes=self.num_classes, hidden_size=self.hidden_size, dropout_prob=0.0)
+        y_embedder = LabelEmbedder(
+            num_classes=self.num_classes,
+            hidden_size=self.hidden_size,
+            dropout_prob=self.class_dropout_prob,
+        )
 
         if self.per_token:
             batch_size, seq_len, _ = x.shape
@@ -295,7 +420,7 @@ class SelfFlowDiT(nn.Module):
                 t_emb = t_emb_flat.reshape(batch_size, seq_len, -1)
             else:
                 raise ValueError(f"Unsupported per-token timestep rank: {timesteps.ndim}")
-            
+
             y_emb = y_embedder(vector, deterministic=deterministic)
             y_emb = jnp.tile(y_emb[:, None, :], (1, seq_len, 1))
         else:
@@ -308,16 +433,15 @@ class SelfFlowDiT(nn.Module):
         block_summaries = [] if return_block_summaries else None
         for i in range(self.depth):
             x = DiTBlock(
-                hidden_size=self.hidden_size, 
-                num_heads=self.num_heads, 
+                hidden_size=self.hidden_size,
+                num_heads=self.num_heads,
                 mlp_ratio=self.mlp_ratio,
-                per_token=self.per_token
+                per_token=self.per_token,
             )(x, c)
 
             if return_block_summaries:
-                # Token-pooled summary per block: (B, D)
                 block_summaries.append(jnp.mean(x, axis=1))
-            
+
             if (i + 1) == return_features:
                 zs = self.feature_head(x)
             elif (i + 1) == return_raw_features:
@@ -327,12 +451,13 @@ class SelfFlowDiT(nn.Module):
             hidden_size=self.hidden_size,
             patch_size=self.patch_size,
             out_channels=self.out_channels_val,
-            per_token=self.per_token
+            per_token=self.per_token,
         )(x, c)
 
+        # Xử lý learn_sigma: chỉ dùng nửa đầu các channel
         x = self._shufflechannel(x)
-        
-        # PyTorch implementation negates the final prediction
+
+        # Negate output: convert PyTorch prediction (x1-x0) → JAX target (x0-x1)
         x = -x
 
         if return_block_summaries:
@@ -347,25 +472,29 @@ class SelfFlowDiT(nn.Module):
         return x
 
     def _shufflechannel(self, x):
-        """Reorder channels/patches to match expected output format."""
+        """Xử lý output channel cho learn_sigma case.
+
+        Khi learn_sigma=False (mặc định, khớp với SiT-SRA gốc):
+            - Không làm gì, output giữ nguyên (B, N, p*p*in_channels).
+            - Model output token ở format (p1,p2,c) order, khớp với training target.
+
+        Khi learn_sigma=True:
+            - Rearrange từ (p,q,c) → (c,p,q) rồi split lấy nửa đầu.
+            - Các channel đầu là velocity, các channel sau là sigma.
+        """
+        if not self.learn_sigma:
+            return x
+        # learn_sigma=True: rearrange rồi split
         p = self.patch_size
-        x = rearrange(x, "b l (c p q) -> b l (c p q)", p=p, q=p, c=self.out_channels_val) # equivalent to rearranging in torch
-        # wait, the PyTorch implementation says:
-        # x = rearrange(x, "b l (p q c) -> b l (c p q)", p=p, q=p, c=self.out_channels)
         x = rearrange(x, "b l (p q c) -> b l (c p q)", p=p, q=p, c=self.out_channels_val)
-        if self.learn_sigma:
-            x, _ = jnp.split(x, 2, axis=2)
+        x, _ = jnp.split(x, 2, axis=2)
         return x
 
 
 class SelfFlowPerTokenDiT(SelfFlowDiT):
-    """
-    Self-Flow DiT with per-token timestep conditioning.
-    Main model used for Self-Flow inference on ImageNet.
-    """
+    """Self-Flow DiT với per-token timestep conditioning."""
     per_token: bool = True
 
 
-# Thin alias for clarity in the vanilla SiT baseline.
-# Use as: SiTDiT(..., per_token=False)
+# Thin alias để dùng trong baseline SiT thuần (per_token=False).
 SiTDiT = SelfFlowDiT

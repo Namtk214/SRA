@@ -301,6 +301,50 @@ def vanilla_guidance(x: jax.Array, cfg_val: float):
     return x_u + cfg_val * (x_c - x_u)
 
 
+def euler_ode_sample(init, model_fn, num_steps):
+    """Euler ODE sampler: tích phân từ tau=0 (noise) đến tau=1 (data).
+
+    Khớp với euler_sampler của SiT-SRA gốc nhưng dùng convention JAX
+    (tau: 0→noise, 1→data thay vì t: 1→noise, 0→data).
+
+    model_fn(z, t_batch) trả về velocity = x0 - x1 (JAX convention).
+    """
+    ts = jnp.linspace(0.0, 1.0, num_steps + 1)
+    dt = ts[1] - ts[0]
+
+    def step_fn(x, t):
+        t_batch = jnp.ones(x.shape[0]) * t
+        velocity = model_fn(x, t_batch)  # x0 - x1
+        x_next = x + dt * velocity
+        return x_next, x_next
+
+    x_final, _ = jax.lax.scan(step_fn, init, ts[:-1])
+    return x_final
+
+
+def euler_heun_ode_sample(init, model_fn, num_steps):
+    """Euler-Heun (Heun's method) ODE sampler: 2nd-order Runge-Kutta.
+
+    Tương đương euler_sampler(heun=True) của SiT-SRA gốc.
+    model_fn(z, t_batch) trả về velocity = x0 - x1.
+    """
+    ts = jnp.linspace(0.0, 1.0, num_steps + 1)
+    dt = ts[1] - ts[0]
+
+    def step_fn(x, t):
+        t_batch = jnp.ones(x.shape[0]) * t
+        t_next_batch = jnp.ones(x.shape[0]) * (t + dt)
+
+        k1 = model_fn(x, t_batch)
+        x_pred = x + dt * k1
+        k2 = model_fn(x_pred, t_next_batch)
+        x_next = x + dt * 0.5 * (k1 + k2)
+        return x_next, x_next
+
+    x_final, _ = jax.lax.scan(step_fn, init, ts[:-1])
+    return x_final
+
+
 def denoise_loop(
     *,
     model_fn,
@@ -310,21 +354,69 @@ def denoise_loop(
     cfg_scale=None,
     guidance_low=0.0,
     guidance_high=1.0,
-    mode="SDE",
+    mode="ODE",
     sampling_method="euler",
-    reverse: bool = True,
+    reverse: bool = False,
 ):
-    args = Config()
-    args.num_steps = num_steps
-    transport = create_transport(
-        args.transport.path_type,
-        args.transport.prediction,
-        args.transport.loss_weight,
-        args.transport.train_eps,
-        args.transport.sample_eps,
-    )
+    """Vòng lặp denoising chính.
 
-    if mode == "SDE":
+    mode="ODE" (mặc định, khớp với SiT-SRA gốc):
+        Dùng Euler hoặc Euler-Heun ODE. Đơn giản, ổn định, dễ kiểm soát.
+        sampling_method="euler" → Euler ODE.
+        sampling_method="heun"  → Euler-Heun (bậc 2, chất lượng tốt hơn với cùng số bước).
+
+    mode="SDE":
+        Dùng SDE với diffusion_form="sigma", last_step="Mean".
+        Giữ nguyên cho backward compatibility.
+
+    reverse=False (mặc định mới):
+        Tích phân forward tau: 0→1 (noise→data), khớp với convention JAX.
+        Set reverse=True để dùng convention ngược (backward compatible với code cũ).
+    """
+    def wrapped_model_fn(z, t):
+        """Wrap model_fn với CFG và reverse convention."""
+        t_query = 1.0 - t if reverse else t
+
+        if cfg_scale is not None and cfg_scale > 1.0:
+            apply_cfg = jnp.all((guidance_low <= t_query) & (t_query <= guidance_high))
+
+            def true_fn(z_true):
+                bs = z_true.shape[0]
+                z_half = z_true[bs // 2:]
+                z_in = jnp.concatenate((z_half, z_half), axis=0)
+                pred = model_fn(z_in, t_query)
+                pred_cfg = vanilla_guidance(pred, cfg_scale)
+                return jnp.concatenate((pred_cfg, pred_cfg), axis=0)
+
+            def false_fn(z_false):
+                return model_fn(z_false, t_query)
+
+            pred = jax.lax.cond(apply_cfg, true_fn, false_fn, z)
+        else:
+            pred = model_fn(z, t_query)
+
+        return -pred if reverse else pred
+
+    if mode == "ODE":
+        # Euler ODE: khớp với euler_sampler của SiT-SRA gốc
+        if sampling_method in ("euler", "Euler"):
+            return euler_ode_sample(x, wrapped_model_fn, num_steps)
+        elif sampling_method in ("heun", "Heun"):
+            return euler_heun_ode_sample(x, wrapped_model_fn, num_steps)
+        else:
+            raise ValueError(f"ODE sampling_method phải là 'euler' hoặc 'heun', got {sampling_method!r}")
+
+    elif mode == "SDE":
+        # SDE path: giữ nguyên từ bản trước cho backward compatibility
+        args = Config()
+        args.num_steps = num_steps
+        transport = create_transport(
+            args.transport.path_type,
+            args.transport.prediction,
+            args.transport.loss_weight,
+            args.transport.train_eps,
+            args.transport.sample_eps,
+        )
         sampler = FixedSampler(transport)
         sample_fn = sampler.sample_sde(
             sampling_method=args.sde.sampling_method,
@@ -334,32 +426,8 @@ def denoise_loop(
             last_step_size=args.sde.last_step_size,
             num_steps=args.num_steps,
         )
+        samples = sample_fn(x, rng, wrapped_model_fn)
+        return samples[-1]
+
     else:
-        raise NotImplementedError("Only SDE mode is currently supported")
-
-    def wrapped_model_fn(z, t):
-        t_orig = t
-        t = 1.0 - t if reverse else t
-
-        if cfg_scale is not None and cfg_scale > 1.0:
-            apply_cfg = jnp.all((guidance_low <= t) & (t <= guidance_high))
-            
-            def true_fn(z_true):
-                bs = z_true.shape[0]
-                z_half = z_true[bs // 2:]
-                z_in = jnp.concatenate((z_half, z_half), axis=0)
-                pred = model_fn(z_in, t)
-                pred_cfg = vanilla_guidance(pred, cfg_scale)
-                return jnp.concatenate((pred_cfg, pred_cfg), axis=0)
-
-            def false_fn(z_false):
-                return model_fn(z_false, t)
-
-            pred = jax.lax.cond(apply_cfg, true_fn, false_fn, z)
-        else:
-            pred = model_fn(z, t)
-
-        return -pred if reverse else pred
-
-    samples = sample_fn(x, rng, wrapped_model_fn)
-    return samples[-1]
+        raise ValueError(f"mode phải là 'ODE' hoặc 'SDE', got {mode!r}")

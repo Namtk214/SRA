@@ -363,6 +363,7 @@ def run_encoding(
     vae_model="stabilityai/sd-vae-ft-ema",
     group_size=1,
     vae_cache=None,
+    save_moments=True,
 ):
     validate_dependencies()
     os.makedirs(output_dir, exist_ok=True)
@@ -384,32 +385,41 @@ def run_encoding(
     SCALE_FACTOR = 0.18215 
 
     # 2. PMAP Encoding Function
-    @jax.pmap
-    def encode_fn(images, params):
-        # Flax models from Diffusers (with from_pt=True) expect NCHW input format,
-        # otherwise they mistake the Height dimension for the Channel dimension.
-        
-        # Apply VAE
-        latent_dist = vae.apply({"params": params}, images, method=vae.encode).latent_dist
-        
-        # Using MEAN instead of random sampling to make it deterministic 
-        # (similar to stable diffusion training latents cache)
-        latents_nhwc = latent_dist.mean * SCALE_FACTOR
-        
-        # Diffusers Flax VAE outputs latents in NHWC. Let's transpose back to NCHW for matching the standard.
-        latents_nchw = jnp.transpose(latents_nhwc, (0, 3, 1, 2))
-        return latents_nchw
+    # Lưu moments (mean + std) để train.py sample posterior mỗi batch,
+    # khớp với SiT-SRA PyTorch gốc — stochasticity tốt hơn latent cố định.
+    if save_moments:
+        @jax.pmap
+        def encode_fn(images, params):
+            latent_dist = vae.apply({"params": params}, images, method=vae.encode).latent_dist
+            # Diffusers Flax VAE: mean và std đều có shape (N, H, W, C) — NHWC
+            mean_nhwc = latent_dist.mean                           # (N, H, W, 4)
+            std_nhwc = jnp.exp(0.5 * latent_dist.logvar)          # (N, H, W, 4)
+            # Chuyển sang NCHW cho nhất quán với training pipeline
+            mean_nchw = jnp.transpose(mean_nhwc, (0, 3, 1, 2))   # (N, 4, H, W)
+            std_nchw = jnp.transpose(std_nhwc, (0, 3, 1, 2))     # (N, 4, H, W)
+            # Ghép thành moments (N, 8, H, W): 4 channel mean + 4 channel std
+            # Không scale ở đây; scale_factor áp dụng trong train.py khi sample
+            return jnp.concatenate([mean_nchw, std_nchw], axis=1) # (N, 8, H, W)
+    else:
+        @jax.pmap
+        def encode_fn(images, params):
+            latent_dist = vae.apply({"params": params}, images, method=vae.encode).latent_dist
+            latents_nhwc = latent_dist.mean * SCALE_FACTOR
+            latents_nchw = jnp.transpose(latents_nhwc, (0, 3, 1, 2))
+            return latents_nchw
 
     # Replicate PMAP Params across devices
     from flax.jax_utils import replicate
     vae_params_repl = replicate(vae_params)
-    
+
     # 3. Setup DataLoader
     dataloader, num_samples = get_dataloader(data_dir, split, batch_size)
     print(f"Found {num_samples} images in {split} split.")
-    
+    out_channels = 8 if save_moments else 4
+    print(f"Saving {'moments (8ch: mean+std)' if save_moments else 'fixed latents (4ch)'} per image.")
+
     samples_per_shard = (num_samples + num_shards - 1) // num_shards
-    
+
     current_shard = 0
     samples_in_current_shard = 0
     def get_writer(shard_idx):
@@ -417,28 +427,34 @@ def run_encoding(
         return ArrayRecordWriter(path, options=writer_options)
 
     writer = get_writer(current_shard)
-    
+
     for images, labels in tqdm(dataloader, desc=f"Encoding {split}"):
-        
+
         # Reshape to (num_devices, batch_per_device, C, H, W)
         images_np = images.numpy()
         images_jax = jnp.array(images_np.reshape((num_devices, batch_per_device, 3, 256, 256)), dtype=jnp.bfloat16)
-        
+
         # PMAP Encode (Executes simultaneously on all 8 TPUs)
-        latents = encode_fn(images_jax, vae_params_repl)
-        
-        # Flatten back CPU numpy (Batch, 4, 32, 32)
-        latents_np = jax.device_get(latents).reshape((-1, 4, 32, 32)).astype("float32")
+        encoded = encode_fn(images_jax, vae_params_repl)
+
+        # Flatten back CPU numpy: (Batch, out_channels, 32, 32)
+        encoded_np = jax.device_get(encoded).reshape((-1, out_channels, 32, 32)).astype("float32")
         labels_np = labels.numpy()
-        
-        for latent, label in zip(latents_np, labels_np):
-            payload = {
-                "latent": latent,
-                "label": int(label)
-            }
+
+        for record, label in zip(encoded_np, labels_np):
+            if save_moments:
+                payload = {
+                    "moments": record,  # Shape (8, 32, 32): first 4 = mean, last 4 = std
+                    "label": int(label),
+                }
+            else:
+                payload = {
+                    "latent": record,   # Shape (4, 32, 32): fixed latent (mean * scale)
+                    "label": int(label),
+                }
             serialized = pickle.dumps(payload)
             writer.write(serialized)
-            
+
             samples_in_current_shard += 1
             if samples_in_current_shard >= samples_per_shard:
                 writer.close()
@@ -462,6 +478,7 @@ def run_multi_split_encoding(
     vae_model="stabilityai/sd-vae-ft-ema",
     group_size=1,
     vae_cache=None,
+    save_moments=True,
 ):
     for split in resolve_splits(splits):
         run_encoding(
@@ -473,6 +490,7 @@ def run_multi_split_encoding(
             vae_model=vae_model,
             group_size=group_size,
             vae_cache=vae_cache,
+            save_moments=save_moments,
         )
 
 
@@ -500,10 +518,23 @@ def main():
             "Nếu file đã có: load thẳng, bỏ qua bước convert PyTorch."
         ),
     )
+    parser.add_argument(
+        "--save-moments",
+        action="store_true",
+        default=True,
+        help=(
+            "Lưu VAE moments (mean + std, shape 8×32×32) thay vì latent cố định (4×32×32). "
+            "KHUYẾN NGHỊ: moments cho phép train.py sample posterior mỗi batch → "
+            "stochasticity tốt hơn, khớp với SiT-SRA PyTorch gốc. "
+            "Dùng --no-save-moments nếu muốn lưu latent cố định (format cũ)."
+        ),
+    )
+    parser.add_argument("--no-save-moments", dest="save_moments", action="store_false")
 
     args = parser.parse_args()
     splits = resolve_splits(args.split)
     print(f"[prepare_data_tpu] Encoding splits: {', '.join(splits)}")
+    print(f"[prepare_data_tpu] Format: {'moments (mean+std)' if args.save_moments else 'fixed latents'}")
     run_multi_split_encoding(
         splits=splits,
         data_dir=args.data_dir,
@@ -513,6 +544,7 @@ def main():
         group_size=args.group_size,
         vae_model=args.vae_model,
         vae_cache=args.vae_cache,
+        save_moments=args.save_moments,
     )
 
 if __name__ == "__main__":
