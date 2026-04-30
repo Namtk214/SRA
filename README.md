@@ -25,7 +25,7 @@ This branch extends the vanilla SiT backbone with a **LayerSync regularisation**
 python train.py \
     --data-path /path/to/imagenet_latents/*.ar \
     --val-data-path /path/to/val_latents/*.ar \
-    --model-size XL \
+    --model-size B \
     --batch-size 256 \
     --epochs 100 \
     --steps-per-epoch 1000 \
@@ -47,7 +47,7 @@ python train.py \
 ```bash
 python train.py \
     --data-path /path/to/imagenet_latents/*.ar \
-    --model-size XL \
+    --model-size B \
     --batch-size 256 \
     --cfg-dropout-rate 0.1 \
     --layersync-lambda 1.0 \
