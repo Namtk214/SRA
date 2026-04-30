@@ -1622,6 +1622,8 @@ def main():
                              "WARNING: mock batches are not suitable for real training. "
                              "Requires explicit opt-in to prevent silent failures.")
     args = parser.parse_args()
+    # Orbax requires absolute checkpoint paths
+    args.ckpt_dir = os.path.abspath(args.ckpt_dir)
 
     if args.preflight_only:
         args.preflight_checks = True
