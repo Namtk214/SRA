@@ -32,8 +32,8 @@ python train.py \
     --learning-rate 1e-4 \
     --cfg-dropout-rate 0.1 \
     --layersync-lambda 1.0 \
-    --layersync-weak-layer 8 \
-    --layersync-strong-layer 16 \
+    --layersync-weak-layer 4 \
+    --layersync-strong-layer 8 \
     --vae-model /kaggle/input/models/damtrunghieu/sdvae-ema/flax/default/1 \
     --inception-score-weights /kaggle/input/models/ctlcmleon/inception-v3/pytorch/default/1/inception_v3_google-0cc3c7bd.pth \
     --ckpt-dir ./checkpoints/layersync \
@@ -93,8 +93,8 @@ python train.py \
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--layersync-lambda` | `0.0` | LayerSync loss weight (`0.0` = disabled) |
-| `--layersync-weak-layer` | `8` | Early (weak) block index for feature extraction |
-| `--layersync-strong-layer` | `16` | Late (strong) block index for feature extraction |
+| `--layersync-weak-layer` | `8` | Early (weak) block index for feature extraction (must be ≤ depth) |
+| `--layersync-strong-layer` | `16` | Late (strong) block index for feature extraction (must be ≤ depth) |
 
 ### Checkpointing
 
