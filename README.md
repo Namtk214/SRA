@@ -113,11 +113,14 @@ python train.py \
     --learning-rate 1e-4 \
     --ema-decay 0.9999 \
     --grad-clip 1.0 \
+    --cfg-prob 0.1 \
     --block-out-s 8 \
     --block-out-t 20 \
     --t-max 0.2 \
     --align-weight 0.2 \
     --loss-type sml1 \
+    --sample-cfg-scale 1.0 \
+    --fid-cfg-scale 1.0 \
     --ckpt-dir /path/to/checkpoints \
     --vae-model /path/to/sd-vae \
     --wandb-project selfflow-jax \
@@ -137,6 +140,7 @@ python train.py \
 | `--learning-rate` | `1e-4` | AdamW learning rate (weight_decay=0) |
 | `--ema-decay` | `0.9999` | EMA decay for teacher network |
 | `--grad-clip` | `1.0` | Max gradient norm |
+| `--cfg-prob` | `0.0` | Label dropout prob for CFG training (0.1 recommended) |
 | `--data-path` | required | Glob pattern to training `.ar` files |
 | `--val-data-path` | `None` | Glob pattern to validation `.ar` files |
 
