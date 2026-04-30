@@ -1,119 +1,160 @@
-# Self-Flow ImageNet Inference
+# LayerSync SiT Baseline (JAX / TPU)
 
-This folder contains inference code for generating images with our Self-Flow trained diffusion model on ImageNet 256×256.
+**LayerSync** baseline for ImageNet 256×256, implemented in JAX/Flax and optimised for Kaggle TPU (v5p-8) training.
 
-## Overview
+This branch extends the vanilla SiT backbone with a **LayerSync regularisation** loss that encourages alignment between weak (early) and strong (late) block representations via cosine similarity, guided by a tunable lambda weight.
 
-**Self-Flow** (Self-Supervised Flow Matching for Scalable Multi-Modal Synthesis) is a training framework that combines the flow matching objective with a self-supervised feature reconstruction objective.
+## Features
 
-This inference code allows you to:
-
-1. Load a Self-Flow checkpoints (pretrained on ImageNet 256x256)
-2. Generate 50,000 images for FID evaluation
-
-The generated samples can be evaluated using the [ADM evaluation suite](https://github.com/openai/guided-diffusion/tree/main/evaluations).
-
-## Requirements
-
-```bash
-pip install -r requirements.txt
-```
+| Feature | Description |
+|---------|-------------|
+| **Flow Matching** | Velocity prediction with uniform timestep sampling (`τ ∈ [0,1]`) |
+| **LayerSync Loss** | Cosine alignment between weak/strong block features (`--layersync-lambda`) |
+| **Classifier-Free Guidance** | `--cfg-dropout-rate` label dropout during training; `--sample-cfg-scale` at inference |
+| **Periodic Checkpointing** | `--ckpt-freq` / `--ckpt-keep` with automatic cleanup |
+| **Resume Training** | `--resume` restores from latest checkpoint (msgpack or Orbax) |
+| **Kaggle TPU Compat** | Shardy dialect disabled (`JAX_USE_SHARDY=0`), Orbax fallback to msgpack |
+| **EMA** | Exponential moving average of online params (`--ema-decay 0.9999`) |
+| **Integrated Metrics** | FID, sFID, IS, Precision/Recall computed during training |
 
 ## Quick Start
 
-### Download Checkpoint
-
-```python
-from huggingface_hub import hf_hub_download
-
-checkpoint_path = hf_hub_download(
-    repo_id="Hila/selfflow-imagenet256",
-    filename="selfflow_imagenet256.pt"
-)
-```
-
-### Generate 50k samples (multi-GPU recommended)
+### Training on Kaggle TPU
 
 ```bash
-torchrun --nnodes=1 --nproc_per_node=8 sample.py \
-    --ckpt checkpoints/selfflow_imagenet256.pt \
-    --output-dir ./samples \
-    --num-fid-samples 50000
+python train.py \
+    --data-path /path/to/imagenet_latents/*.ar \
+    --val-data-path /path/to/val_latents/*.ar \
+    --model-size XL \
+    --batch-size 256 \
+    --epochs 100 \
+    --steps-per-epoch 1000 \
+    --learning-rate 1e-4 \
+    --cfg-dropout-rate 0.1 \
+    --layersync-lambda 1.0 \
+    --layersync-weak-layer 8 \
+    --layersync-strong-layer 16 \
+    --vae-model /kaggle/input/models/damtrunghieu/sdvae-ema/flax/default/1 \
+    --inception-score-weights /kaggle/input/models/ctlcmleon/inception-v3/pytorch/default/1/inception_v3_google-0cc3c7bd.pth \
+    --ckpt-dir ./checkpoints/layersync \
+    --ckpt-freq 5000 \
+    --ckpt-keep 2 \
+    --wandb-project layersync-jax
 ```
 
-### Single GPU
+### Resume from Checkpoint
 
 ```bash
-python sample.py \
-    --ckpt checkpoints/selfflow_imagenet256.pt \
-    --output-dir ./samples \
-    --num-fid-samples 50000 \
-    --batch-size 64
+python train.py \
+    --data-path /path/to/imagenet_latents/*.ar \
+    --model-size XL \
+    --batch-size 256 \
+    --cfg-dropout-rate 0.1 \
+    --layersync-lambda 1.0 \
+    --vae-model /kaggle/input/models/damtrunghieu/sdvae-ema/flax/default/1 \
+    --inception-score-weights /kaggle/input/models/ctlcmleon/inception-v3/pytorch/default/1/inception_v3_google-0cc3c7bd.pth \
+    --ckpt-dir ./checkpoints/layersync \
+    --resume
 ```
 
-## Command Line Arguments
+## Training Arguments
+
+### Core
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--ckpt` | required | Path to model checkpoint |
-| `--output-dir` | `./samples` | Output directory for generated samples |
-| `--num-fid-samples` | `50000` | Number of samples to generate |
-| `--batch-size` | `64` | Batch size per GPU |
-| `--num-steps` | `250` | Number of diffusion sampling steps |
-| `--mode` | `SDE` | Sampling mode: `SDE` or `ODE` |
-| `--seed` | `31` | Random seed for reproducibility |
-| `--cfg-scale` | `1.0` | Classifier-free guidance scale (1.0 = no guidance, as used in paper) |
+| `--data-path` | *required* | Path/glob to training ArrayRecord files |
+| `--val-data-path` | `None` | Path/glob to validation ArrayRecord files |
+| `--model-size` | `XL` | DiT backbone: `S`, `B`, `L`, `XL` |
+| `--batch-size` | `256` | Global batch size (divided across devices) |
+| `--epochs` | `100` | Number of training epochs |
+| `--steps-per-epoch` | `1000` | Steps per epoch |
+| `--learning-rate` | `1e-4` | AdamW learning rate |
+| `--grad-clip` | `1.0` | Gradient clipping max norm |
+| `--ema-decay` | `0.9999` | EMA decay rate |
 
-## Evaluation
+### Model Weights (Kaggle)
 
-The generated `.npz` file can be used with the [ADM evaluation suite](https://github.com/openai/guided-diffusion/tree/main/evaluations) to compute FID, IS, Precision, and Recall.
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--vae-model` | `stabilityai/sd-vae-ft-ema` | Path to VAE model (local Flax dir or HF repo ID) |
+| `--vae-hf-config` | `stabilityai/sd-vae-ft-ema` | HF config ID fallback when VAE dir has no `config.json` |
+| `--inception-score-weights` | `None` | Path to local Inception-v3 `.pth` weights for IS/FID |
 
-### Download Reference Statistics
+### Classifier-Free Guidance
 
-```bash
-wget https://openaipublic.blob.core.windows.net/diffusion/jul-2021/ref_batches/imagenet/256/VIRTUAL_imagenet256_labeled.npz
-```
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--cfg-dropout-rate` | `0.1` | Label dropout probability for CFG training |
+| `--sample-cfg-scale` | `1.0` | CFG scale at sampling time |
 
-### Run Evaluation
+### LayerSync
 
-```bash
-python evaluator.py \
-    VIRTUAL_imagenet256_labeled.npz \
-    ./samples/samples_50000.npz ./samples
-```
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--layersync-lambda` | `0.0` | LayerSync loss weight (`0.0` = disabled) |
+| `--layersync-weak-layer` | `8` | Early (weak) block index for feature extraction |
+| `--layersync-strong-layer` | `16` | Late (strong) block index for feature extraction |
 
-## Model Architecture
+### Checkpointing
 
-The Self-Flow model is based on SiT-XL/2 with the following specifications
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--ckpt-dir` | `./checkpoints` | Checkpoint save directory |
+| `--ckpt-freq` | `5000` | Save every N steps (`0` = end only) |
+| `--ckpt-keep` | `1` | Number of recent checkpoints to retain |
+| `--resume` | `false` | Resume from latest checkpoint |
 
-A key architectural modification is **per-token timestep conditioning**, which allows each token to have a different noise level during training.
+### Evaluation
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--eval-freq` | `500` | Validation loss eval frequency |
+| `--sample-freq` | `1000` | Sample generation frequency |
+| `--fid-freq` | `10000` | FID computation frequency |
+| `--num-fid-samples` | `4000` | Number of samples for FID |
+| `--fid-num-steps` | `50` | ODE steps for FID generation |
 
 ## Project Structure
 
 ```
-Self-Flow/
-├── sample.py           # Main sampling script
-├── checkpoints/        # Place model checkpoints here
-├── requirements.txt    # Python dependencies
-├── README.md           # This file
-└── src/                # Model and sampling implementations
-    ├── model.py        # SelfFlowPerTokenDiT model
-    ├── sampling.py     # Diffusion sampling utilities
-    └── utils.py        # Position encoding utilities
+layersync-sit/
+├── train.py                # Training script (JAX/Flax, TPU-optimised)
+├── sample.py               # Standalone sampling script
+├── prepare_data.py         # Dataset preparation utilities
+├── prepare_data_tpu.py     # TPU-specific data preparation
+├── requirements.txt        # Python dependencies
+├── README.md               # This file
+└── src/
+    ├── model.py            # SelfFlowDiT with class_dropout_prob
+    ├── jax_compat.py       # replicate_tree / unreplicate_tree helpers
+    ├── sampling.py         # Flow matching ODE/SDE samplers
+    ├── metrics.py          # FID, IS, Precision/Recall
+    ├── fid_utils.py        # FID statistics computation
+    └── utils.py            # Position encoding utilities
 ```
 
-## Training Details
+## LayerSync Loss Details
 
-The model was trained using the following configuration:
+LayerSync regularisation aligns representations from two transformer blocks:
 
-- **Model**: SiT-XL/2 with per-token timestep conditioning
-- **Training**: Self-Flow with per-token masking (25% mask ratio)
-- **Optimizer**: AdamW with gradient clipping (max_norm=1)
-- **Mixed precision**: BFloat16
-- **Self-distillation**: Teacher at layer 20 (EMA), student at layer 8
+1. Extract features from the **weak layer** (early block, e.g. layer 8) and **strong layer** (late block, e.g. layer 16)
+2. Stop gradients on the strong layer features (treat as target)
+3. Compute **negative mean cosine similarity** between L2-normalised token features
+4. Scale by `--layersync-lambda` and add to the generative MSE loss
+
+The intuition is that encouraging early blocks to produce representations similar to late blocks improves feature reuse and training efficiency.
+
+## Environment Notes
+
+This branch includes automatic Kaggle TPU compatibility fixes:
+
+- `JAX_USE_SHARDY=0` / `ENABLE_SHARDY=0` — disables SDY dialect
+- `JAX_PLATFORMS=tpu,cpu` — explicit platform ordering
+- Orbax checkpoint fallback to `flax.serialization` (msgpack) when `flax.training.checkpoints` is unavailable
 
 ## Acknowledgments
 
-This code builds upon:
-- [REPA](https://github.com/sihyun-yu/REPA) - Representation Alignment for Generation
-- [SiT](https://github.com/willisma/SiT) - Scalable Interpolant Transformers
+- [SiT](https://github.com/willisma/SiT) — Scalable Interpolant Transformers
+- [REPA](https://github.com/sihyun-yu/REPA) — Representation Alignment for Generation
+- [Self-Flow](https://github.com/thanhlamauto/Self-Flow) — Self-Supervised Flow Matching
