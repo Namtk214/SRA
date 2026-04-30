@@ -30,6 +30,8 @@ python train.py \
     --steps-per-epoch 1000 \
     --learning-rate 1e-4 \
     --cfg-prob 0.1 \
+    --vae-model /kaggle/input/models/damtrunghieu/sdvae-ema/flax/default/1 \
+    --inception-score-weights /kaggle/input/models/ctlcmleon/inception-v3/pytorch/default/1/inception_v3_google-0cc3c7bd.pth \
     --ckpt-dir ./checkpoints/sit-vanilla \
     --ckpt-freq 5000 \
     --ckpt-keep 2 \
@@ -44,6 +46,8 @@ python train.py \
     --model-size XL \
     --batch-size 256 \
     --cfg-prob 0.1 \
+    --vae-model /kaggle/input/models/damtrunghieu/sdvae-ema/flax/default/1 \
+    --inception-score-weights /kaggle/input/models/ctlcmleon/inception-v3/pytorch/default/1/inception_v3_google-0cc3c7bd.pth \
     --ckpt-dir ./checkpoints/sit-vanilla \
     --resume
 ```
@@ -63,6 +67,14 @@ python train.py \
 | `--learning-rate` | `1e-4` | AdamW learning rate |
 | `--grad-clip` | `1.0` | Gradient clipping max norm |
 | `--ema-decay` | `0.9999` | EMA decay rate |
+
+### Model Weights (Kaggle)
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--vae-model` | `stabilityai/sd-vae-ft-ema` | Path to VAE model (local Flax dir or HF repo ID) |
+| `--vae-hf-config` | `stabilityai/sd-vae-ft-ema` | HF config ID fallback when VAE dir has no `config.json` |
+| `--inception-score-weights` | `None` | Path to local Inception-v3 `.pth` weights for IS/FID (avoids network download) |
 
 ### Classifier-Free Guidance
 
