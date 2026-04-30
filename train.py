@@ -405,7 +405,13 @@ import jax
 import jax.numpy as jnp
 import optax
 import wandb
-from flax.training import train_state, checkpoints
+from flax.training import train_state
+try:
+    from flax.training import checkpoints
+except (ImportError, AttributeError):
+    checkpoints = None
+    log_stage("[WARN] flax.training.checkpoints unavailable (orbax version mismatch). "
+              "Using msgpack-based checkpoint fallback.")
 from flax import jax_utils
 import numpy as np
 try:
@@ -2218,16 +2224,24 @@ def main():
     os.makedirs(args.ckpt_dir, exist_ok=True)
     unreplicated_params = jax_utils.unreplicate(state.params)
     unreplicated_ema    = jax_utils.unreplicate(ema_params)
-    checkpoints.save_checkpoint(
-        ckpt_dir=args.ckpt_dir,
-        target=unreplicated_params,
-        step=global_step,
-    )
-    checkpoints.save_checkpoint(
-        ckpt_dir=os.path.join(args.ckpt_dir, "ema"),
-        target=unreplicated_ema,
-        step=global_step,
-    )
+    def _save_ckpt(ckpt_dir, target, step):
+        """Save checkpoint using flax.checkpoints or msgpack fallback."""
+        os.makedirs(ckpt_dir, exist_ok=True)
+        if checkpoints is not None:
+            checkpoints.save_checkpoint(
+                ckpt_dir=ckpt_dir,
+                target=target,
+                step=step,
+            )
+        else:
+            import flax.serialization
+            ckpt_path = os.path.join(ckpt_dir, f"checkpoint_{step}.msgpack")
+            with open(ckpt_path, "wb") as f:
+                f.write(flax.serialization.to_bytes(target))
+            log_stage(f"Saved msgpack checkpoint: {ckpt_path}")
+
+    _save_ckpt(args.ckpt_dir, unreplicated_params, global_step)
+    _save_ckpt(os.path.join(args.ckpt_dir, "ema"), unreplicated_ema, global_step)
     if _flax_decode_cache[0] is not None and isinstance(_flax_decode_cache[0], VAEDecodeSubprocess):
         _flax_decode_cache[0].shutdown()
     if _is_worker[0] is not None:
