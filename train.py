@@ -1476,52 +1476,68 @@ def main():
     # ── Resume from checkpoint ────────────────────────────────────────────────
     resumed_step = 0
     if args.resume:
-        def _restore_ckpt(ckpt_dir, target):
-            """Restore from flax checkpoints or msgpack fallback."""
-            if checkpoints is not None:
-                try:
-                    restored = checkpoints.restore_checkpoint(ckpt_dir, target)
-                    return restored
-                except Exception as e:
-                    log_stage(f"flax.checkpoints restore failed: {e}")
-            # Msgpack fallback
-            existing = sorted(glob.glob(os.path.join(ckpt_dir, "checkpoint_*.msgpack")))
-            if existing:
-                import flax.serialization
-                latest = existing[-1]
-                log_stage(f"Restoring msgpack checkpoint: {latest}")
-                with open(latest, "rb") as f:
-                    return flax.serialization.from_bytes(target, f.read())
-            return target
+        import re as _re
+        import flax.serialization
 
-        # Restore train state params
-        try:
-            restored_params = _restore_ckpt(args.ckpt_dir, state.params)
-            restored_step = int(state.step)
-            if checkpoints is not None:
-                state = checkpoints.restore_checkpoint(args.ckpt_dir, state)
-                resumed_step = int(state.step)
-            else:
-                # Msgpack: extract step from filename
-                existing = sorted(glob.glob(os.path.join(args.ckpt_dir, "checkpoint_*.msgpack")))
-                if existing:
-                    import re
-                    match = re.search(r"checkpoint_(\d+)", existing[-1])
-                    if match:
-                        resumed_step = int(match.group(1))
-                    state = state.replace(params=restored_params, step=resumed_step)
-            if resumed_step > 0:
-                log_stage(f"Resumed train_state from {args.ckpt_dir} at step {resumed_step}")
-        except Exception as e:
-            log_stage(f"No train_state checkpoint: {e}")
+        def _extract_step_from_dir(ckpt_dir):
+            """Extract latest step number from checkpoint filenames."""
+            ckpt_files = sorted(glob.glob(os.path.join(ckpt_dir, "checkpoint_*")))
+            for f in reversed(ckpt_files):
+                m = _re.search(r"checkpoint_(\d+)", os.path.basename(f))
+                if m:
+                    return int(m.group(1))
+            return 0
+
+        # Build template for the full training checkpoint dict
+        train_ckpt_template = {
+            'params': state.params,
+            'opt_state': state.opt_state,
+            'step': 0,
+        }
+
+        restored_ckpt = None
+        # 1. Try msgpack first (most reliable on Kaggle)
+        msgpack_files = sorted(glob.glob(os.path.join(args.ckpt_dir, "checkpoint_*.msgpack")))
+        if msgpack_files:
+            latest = msgpack_files[-1]
+            log_stage(f"Resuming from msgpack: {os.path.basename(latest)}")
+            with open(latest, "rb") as f:
+                restored_ckpt = flax.serialization.from_bytes(train_ckpt_template, f.read())
+            resumed_step = int(restored_ckpt['step'])
+        # 2. Try orbax/flax checkpoints
+        elif checkpoints is not None:
+            try:
+                restored_ckpt = checkpoints.restore_checkpoint(args.ckpt_dir, train_ckpt_template)
+                if restored_ckpt is not train_ckpt_template:
+                    resumed_step = int(restored_ckpt['step'])
+                else:
+                    restored_ckpt = None
+            except Exception as e:
+                log_stage(f"flax.checkpoints restore failed: {e}")
+
+        if restored_ckpt is not None:
+            state = state.replace(
+                params=restored_ckpt['params'],
+                opt_state=restored_ckpt['opt_state'],
+                step=resumed_step,
+            )
+            log_stage(f"Resumed train_state (params + optimizer) from {args.ckpt_dir} at step {resumed_step}")
 
         # Restore EMA params
         ema_dir = os.path.join(args.ckpt_dir, "ema")
-        try:
-            ema_params = _restore_ckpt(ema_dir, ema_params)
+        ema_msgpack = sorted(glob.glob(os.path.join(ema_dir, "checkpoint_*.msgpack")))
+        if ema_msgpack:
+            with open(ema_msgpack[-1], "rb") as f:
+                ema_params = flax.serialization.from_bytes(ema_params, f.read())
             log_stage(f"Resumed EMA params from {ema_dir}")
-        except Exception as e:
-            log_stage(f"No EMA checkpoint: {e}")
+        elif checkpoints is not None:
+            try:
+                restored_ema = checkpoints.restore_checkpoint(ema_dir, ema_params)
+                if restored_ema is not ema_params:
+                    ema_params = restored_ema
+                    log_stage(f"Resumed EMA params from {ema_dir}")
+            except Exception:
+                pass
 
         if resumed_step == 0:
             log_stage("No checkpoint found, starting fresh.")
@@ -2215,10 +2231,15 @@ def main():
                 os.remove(existing.pop(0))
 
     def _save_ckpt_full(state, ema_params, step, args):
-        """Save both online params and EMA params."""
+        """Save full training state (params + optimizer + step) and EMA params."""
         unrep_state = jax_utils.unreplicate(state)
         unrep_ema = jax_utils.unreplicate(ema_params)
-        _save_ckpt(args.ckpt_dir, unrep_state.params, step)
+        train_ckpt = {
+            'params': unrep_state.params,
+            'opt_state': unrep_state.opt_state,
+            'step': step,
+        }
+        _save_ckpt(args.ckpt_dir, train_ckpt, step)
         _save_ckpt(os.path.join(args.ckpt_dir, "ema"), unrep_ema, step)
         log_stage(f"Checkpoint saved at step {step} → {args.ckpt_dir}")
 
