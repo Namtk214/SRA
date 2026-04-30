@@ -14,7 +14,9 @@ os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 # Disable Shardy (sdy) dialect — Kaggle TPU plugin may not support it
-os.environ.setdefault("JAX_USE_SHARDY", "0")
+# Must be set BEFORE import jax
+os.environ["JAX_USE_SHARDY"] = "0"
+os.environ["ENABLE_SHARDY"] = "0"
 os.environ.setdefault("JAX_PLATFORMS", "tpu,cpu")
 
 
