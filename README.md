@@ -65,7 +65,7 @@ python train.py \
 |----------|---------|-------------|
 | `--data-path` | *required* | Path/glob to training ArrayRecord files |
 | `--val-data-path` | `None` | Path/glob to validation ArrayRecord files |
-| `--model-size` | `XL` | DiT backbone: `S`, `B`, `L`, `XL` |
+| `--model-size` | `B` | DiT backbone: `S`, `B`, `L`, `XL` |
 | `--batch-size` | `256` | Global batch size (divided across devices) |
 | `--epochs` | `100` | Number of training epochs |
 | `--steps-per-epoch` | `1000` | Steps per epoch |
