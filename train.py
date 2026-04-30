@@ -14,6 +14,10 @@ import random
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+# Disable Shardy (sdy) dialect — Kaggle TPU plugin may not support it
+os.environ["JAX_USE_SHARDY"] = "0"
+os.environ["ENABLE_SHARDY"] = "0"
+os.environ.setdefault("JAX_PLATFORMS", "tpu,cpu")
 
 
 def log_stage(message):
@@ -406,7 +410,13 @@ import jax
 import jax.numpy as jnp
 import optax
 import wandb
-from flax.training import train_state, checkpoints
+from flax.training import train_state
+try:
+    from flax.training import checkpoints
+except (ImportError, AttributeError):
+    checkpoints = None
+    log_stage("[WARN] flax.training.checkpoints unavailable (orbax version mismatch). "
+              "Using msgpack-based checkpoint fallback.")
 from flax import jax_utils
 import numpy as np
 try:
@@ -1390,6 +1400,12 @@ def main():
     parser.add_argument("--steps-per-epoch", type=int, default=1000)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--ckpt-dir", type=str, default="./checkpoints")
+    parser.add_argument("--ckpt-freq", type=int, default=5000,
+                        help="Save checkpoint every N steps (0 = only at end).")
+    parser.add_argument("--ckpt-keep", type=int, default=1,
+                        help="Number of recent checkpoints to keep.")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume training from latest checkpoint in --ckpt-dir.")
     parser.add_argument("--data-path", type=str, required=True, help="Path/glob to training ArrayRecord files")
     parser.add_argument("--val-data-path", type=str, default=None)
     parser.add_argument("--wandb-project", type=str, default="sit-vanilla-jax")
@@ -1404,6 +1420,8 @@ def main():
     )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
+    parser.add_argument("--cfg-prob", type=float, default=0.0,
+                        help="Label dropout probability for classifier-free guidance training (0 = disabled).")
     parser.add_argument(
         "--skip-layer-connection",
         action="store_true",
@@ -1675,6 +1693,7 @@ def main():
 
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size)
+    config["cfg_prob"] = args.cfg_prob
     depth = int(config["depth"])
 
     log_stage(
@@ -1731,6 +1750,38 @@ def main():
         args.grad_clip,
         skip_layer_connection=args.skip_layer_connection,
     )
+
+    # ── Resume from checkpoint if requested ───────────────────────────────────
+    resumed_step = 0
+    if args.resume:
+        import flax.serialization
+        # Try msgpack first (Kaggle), then flax.checkpoints
+        msgpack_files = sorted(glob.glob(os.path.join(args.ckpt_dir, "checkpoint_*.msgpack")))
+        if msgpack_files:
+            latest = msgpack_files[-1]
+            log_stage(f"Resuming from msgpack: {os.path.basename(latest)}")
+            with open(latest, "rb") as f:
+                restored_params = flax.serialization.from_bytes(state.params, f.read())
+            state = state.replace(params=restored_params)
+            resumed_step = int(latest.rsplit("_", 1)[-1].replace(".msgpack", ""))
+            # EMA
+            ema_msgpack = sorted(glob.glob(os.path.join(args.ckpt_dir, "ema", "checkpoint_*.msgpack")))
+            if ema_msgpack:
+                with open(ema_msgpack[-1], "rb") as f:
+                    ema_params = flax.serialization.from_bytes(ema_params, f.read())
+            log_stage(f"Resumed at step {resumed_step}")
+        elif checkpoints is not None:
+            try:
+                state = checkpoints.restore_checkpoint(args.ckpt_dir, state)
+                resumed_step = int(state.step)
+                ema_ckpt_dir = os.path.join(args.ckpt_dir, "ema")
+                ema_params = checkpoints.restore_checkpoint(ema_ckpt_dir, ema_params)
+                log_stage(f"Resumed at step {resumed_step}")
+            except Exception as e:
+                log_stage(f"No checkpoint found, starting fresh: {e}")
+        else:
+            log_stage("No checkpoint found, starting fresh.")
+
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
@@ -2405,12 +2456,43 @@ def main():
             logger.shutdown()
             return
 
+    # ── Checkpoint helpers ─────────────────────────────────────────────────────
+    def _save_ckpt(ckpt_dir, target, step):
+        """Save checkpoint using flax.checkpoints or msgpack fallback."""
+        os.makedirs(ckpt_dir, exist_ok=True)
+        if checkpoints is not None:
+            checkpoints.save_checkpoint(ckpt_dir, target, step, keep=args.ckpt_keep, overwrite=True)
+        else:
+            import flax.serialization
+            path = os.path.join(ckpt_dir, f"checkpoint_{step}.msgpack")
+            with open(path, "wb") as f:
+                f.write(flax.serialization.to_bytes(target))
+            # Cleanup old msgpack checkpoints
+            existing = sorted(glob.glob(os.path.join(ckpt_dir, "checkpoint_*.msgpack")))
+            while len(existing) > args.ckpt_keep:
+                os.remove(existing.pop(0))
+
+    def _save_ckpt_full(state, ema_params, step, args):
+        """Save both online params and EMA params."""
+        unrep_params = jax_utils.unreplicate(state.params)
+        unrep_ema = jax_utils.unreplicate(ema_params)
+        _save_ckpt(args.ckpt_dir, unrep_params, step)
+        _save_ckpt(os.path.join(args.ckpt_dir, "ema"), unrep_ema, step)
+        log_stage(f"Checkpoint saved at step {step}")
+
     # ── Training loop ─────────────────────────────────────────────────────────
-    global_step = 0
+    global_step = resumed_step
     t0 = time.time()
 
-    for epoch in range(args.epochs):
+    total_steps = args.epochs * args.steps_per_epoch
+    start_epoch = resumed_step // args.steps_per_epoch
+    start_step = resumed_step % args.steps_per_epoch
+
+    for epoch in range(start_epoch, args.epochs):
+        _step_start = start_step if epoch == start_epoch else 0
         for step in range(args.steps_per_epoch):
+            if step < _step_start:
+                continue
             if data_iterator is not None:
                 if prefetched_train_batch is not None:
                     batch = prefetched_train_batch
@@ -2434,6 +2516,10 @@ def main():
                 state, ema_params, (batch_x, batch_y), rng, ema_decay_rep
             )
             global_step += 1
+
+            # ── Periodic checkpoint save ──────────────────────────────────────
+            if args.ckpt_freq > 0 and global_step % args.ckpt_freq == 0:
+                _save_ckpt_full(state, ema_params, global_step, args)
             accumulated_train_tflops += flops_per_train_step / 1e12
 
             # Async metric logging
@@ -2504,20 +2590,8 @@ def main():
                                  args=(latents_dev, sample_classes, global_step),
                                  daemon=True).start()
 
-    # ── Checkpoint save (online params + EMA params) ──────────────────────────
-    os.makedirs(args.ckpt_dir, exist_ok=True)
-    unreplicated_params = jax_utils.unreplicate(state.params)
-    unreplicated_ema    = jax_utils.unreplicate(ema_params)
-    checkpoints.save_checkpoint(
-        ckpt_dir=args.ckpt_dir,
-        target=unreplicated_params,
-        step=global_step,
-    )
-    checkpoints.save_checkpoint(
-        ckpt_dir=os.path.join(args.ckpt_dir, "ema"),
-        target=unreplicated_ema,
-        step=global_step,
-    )
+    # ── Final checkpoint save ──────────────────────────────────────────────────
+    _save_ckpt_full(state, ema_params, global_step, args)
     if _flax_decode_cache[0] is not None and isinstance(_flax_decode_cache[0], VAEDecodeSubprocess):
         _flax_decode_cache[0].shutdown()
     if _is_worker[0] is not None:
