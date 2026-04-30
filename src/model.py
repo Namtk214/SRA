@@ -242,6 +242,7 @@ class SelfFlowDiT(nn.Module):
     learn_sigma: bool = False
     compatibility_mode: bool = False
     per_token: bool = False
+    class_dropout_prob: float = 0.0
 
     def setup(self):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
@@ -282,7 +283,7 @@ class SelfFlowDiT(nn.Module):
         x = x + self.pos_embed_val
 
         t_embedder = TimestepEmbedder(hidden_size=self.hidden_size)
-        y_embedder = LabelEmbedder(num_classes=self.num_classes, hidden_size=self.hidden_size, dropout_prob=0.0)
+        y_embedder = LabelEmbedder(num_classes=self.num_classes, hidden_size=self.hidden_size, dropout_prob=self.class_dropout_prob)
 
         if self.per_token:
             batch_size, seq_len, _ = x.shape
