@@ -455,6 +455,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         num_classes=config["num_classes"],
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
+        class_dropout_prob=config.get("cfg_prob", 0.0),
         per_token=False,
     )
 
@@ -884,6 +885,7 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         num_classes=config["num_classes"],
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
+        class_dropout_prob=config.get("cfg_prob", 0.0),
         per_token=False,
     )
 
@@ -983,6 +985,7 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         num_classes=config["num_classes"],
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
+        class_dropout_prob=config.get("cfg_prob", 0.0),
         per_token=False,
     )
 
@@ -1219,6 +1222,9 @@ def main():
     )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
+    parser.add_argument("--cfg-prob", type=float, default=0.0,
+                        help="Label dropout probability for classifier-free guidance training. "
+                             "0.0 = no CFG. 0.1 = recommended for CFG-enabled training.")
     parser.add_argument(
         "--loss-type",
         type=str,
@@ -1419,6 +1425,7 @@ def main():
 
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size)
+    config["cfg_prob"] = args.cfg_prob
     depth = int(config["depth"])
 
     log_stage(
