@@ -1218,6 +1218,8 @@ def main():
                         help="Save checkpoint every N steps (0 = only at end).")
     parser.add_argument("--ckpt-keep", type=int, default=1,
                         help="Number of recent checkpoints to keep. Older ones are deleted.")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume training from latest checkpoint in --ckpt-dir.")
     parser.add_argument("--data-path", type=str, required=True, help="Path/glob to training ArrayRecord files")
     parser.add_argument("--val-data-path", type=str, default=None)
     parser.add_argument("--wandb-project", type=str, default="sit-sra-jax")
@@ -1468,6 +1470,60 @@ def main():
     # ── Model, state, EMA ─────────────────────────────────────────────────────
     rng = jax.random.PRNGKey(42)
     state, ema_params = create_train_state(rng, config, args.learning_rate, args.grad_clip)
+
+    # ── Resume from checkpoint ────────────────────────────────────────────────
+    resumed_step = 0
+    if args.resume:
+        def _restore_ckpt(ckpt_dir, target):
+            """Restore from flax checkpoints or msgpack fallback."""
+            if checkpoints is not None:
+                try:
+                    restored = checkpoints.restore_checkpoint(ckpt_dir, target)
+                    return restored
+                except Exception as e:
+                    log_stage(f"flax.checkpoints restore failed: {e}")
+            # Msgpack fallback
+            existing = sorted(glob.glob(os.path.join(ckpt_dir, "checkpoint_*.msgpack")))
+            if existing:
+                import flax.serialization
+                latest = existing[-1]
+                log_stage(f"Restoring msgpack checkpoint: {latest}")
+                with open(latest, "rb") as f:
+                    return flax.serialization.from_bytes(target, f.read())
+            return target
+
+        # Restore train state params
+        try:
+            restored_params = _restore_ckpt(args.ckpt_dir, state.params)
+            restored_step = int(state.step)
+            if checkpoints is not None:
+                state = checkpoints.restore_checkpoint(args.ckpt_dir, state)
+                resumed_step = int(state.step)
+            else:
+                # Msgpack: extract step from filename
+                existing = sorted(glob.glob(os.path.join(args.ckpt_dir, "checkpoint_*.msgpack")))
+                if existing:
+                    import re
+                    match = re.search(r"checkpoint_(\d+)", existing[-1])
+                    if match:
+                        resumed_step = int(match.group(1))
+                    state = state.replace(params=restored_params, step=resumed_step)
+            if resumed_step > 0:
+                log_stage(f"Resumed train_state from {args.ckpt_dir} at step {resumed_step}")
+        except Exception as e:
+            log_stage(f"No train_state checkpoint: {e}")
+
+        # Restore EMA params
+        ema_dir = os.path.join(args.ckpt_dir, "ema")
+        try:
+            ema_params = _restore_ckpt(ema_dir, ema_params)
+            log_stage(f"Resumed EMA params from {ema_dir}")
+        except Exception as e:
+            log_stage(f"No EMA checkpoint: {e}")
+
+        if resumed_step == 0:
+            log_stage("No checkpoint found, starting fresh.")
+
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
@@ -2165,12 +2221,17 @@ def main():
         log_stage(f"Checkpoint saved at step {step} → {args.ckpt_dir}")
 
     # ── Training loop ─────────────────────────────────────────────────────────
-    global_step = 0
+    global_step = resumed_step
     t0 = time.time()
 
-    for epoch in range(args.epochs):
+    # Calculate starting epoch/step when resuming
+    start_epoch = resumed_step // args.steps_per_epoch
+    start_step_in_epoch = resumed_step % args.steps_per_epoch
+
+    for epoch in range(start_epoch, args.epochs):
         epoch_rep = jax_utils.replicate(jnp.int32(epoch))
-        for step in range(args.steps_per_epoch):
+        first_step = start_step_in_epoch if epoch == start_epoch else 0
+        for step in range(first_step, args.steps_per_epoch):
             if data_iterator is not None:
                 if prefetched_train_batch is not None:
                     batch = prefetched_train_batch
