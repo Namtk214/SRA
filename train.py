@@ -2302,7 +2302,7 @@ def main():
                     state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, layersync_lambda_rep
                 )
             else:
-                acc_grads = None
+                all_grads = []
                 for a_idx in range(accum_steps):
                     if data_iterator is not None:
                         if prefetched_train_batch is not None:
@@ -2321,10 +2321,10 @@ def main():
                     micro_y = micro_y.reshape(num_devices, local_batch_size)
 
                     grads_a, rng = pmapped_grad_step(state, (micro_x, micro_y), rng, layersync_lambda_rep)
-                    if acc_grads is None:
-                        acc_grads = grads_a
-                    else:
-                        acc_grads = jax.tree_util.tree_map(lambda a, g: a + g, acc_grads, grads_a)
+                    all_grads.append(grads_a)
+                acc_grads = all_grads[0]
+                for g in all_grads[1:]:
+                    acc_grads = jax.tree_util.tree_map(jnp.add, acc_grads, g)
                 acc_grads = jax.tree_util.tree_map(lambda g: g / accum_steps, acc_grads)
                 state, ema_params, grad_norm = pmapped_apply_grads(state, ema_params, acc_grads, ema_decay_rep)
                 metrics = {"train/grad_norm": grad_norm}
