@@ -2355,37 +2355,49 @@ def main():
         epoch_rep = jax_utils.replicate(jnp.int32(epoch))
         first_step = start_step_in_epoch if epoch == start_epoch else 0
         for step in range(first_step, args.steps_per_epoch):
-            if data_iterator is not None:
-                if prefetched_train_batch is not None:
-                    batch = prefetched_train_batch
-                    prefetched_train_batch = None
-                else:
-                    batch = next(data_iterator)
-                batch_x = jnp.array(batch[0])
-                batch_y = jnp.array(batch[1])
-            else:
-                # Mock fallback: only reaches here if --mock-data was explicitly set
-                rng_mock, = jax.random.split(rng[0], 1)
-                batch_x = jax.random.normal(rng_mock, (args.batch_size, n_patches, patch_dim))
-                batch_y = jax.random.randint(rng_mock, (args.batch_size,), 0, 1000)
-
-            # Reshape for SPMD: (Global, ...) → (Devices, Local, ...)
-            batch_x = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
-            batch_y = batch_y.reshape(num_devices, local_batch_size)
-
             # SRA training step (online student + EMA teacher)
             if accum_steps <= 1:
+                if data_iterator is not None:
+                    if prefetched_train_batch is not None:
+                        batch = prefetched_train_batch
+                        prefetched_train_batch = None
+                    else:
+                        batch = next(data_iterator)
+                    batch_x = jnp.array(batch[0])
+                    batch_y = jnp.array(batch[1])
+                else:
+                    rng_mock, = jax.random.split(rng[0], 1)
+                    batch_x = jax.random.normal(rng_mock, (args.batch_size, n_patches, patch_dim))
+                    batch_y = jax.random.randint(rng_mock, (args.batch_size,), 0, 1000)
+
+                batch_x = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
+                batch_y = batch_y.reshape(num_devices, local_batch_size)
+
                 state, ema_params, metrics, rng = pmapped_train_step(
                     state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, epoch_rep
                 )
             else:
-                # Gradient accumulation: split batch and accumulate grads
-                micro_x = batch_x.reshape(accum_steps, num_devices, local_batch_size // accum_steps, n_patches, patch_dim)
-                micro_y = batch_y.reshape(accum_steps, num_devices, local_batch_size // accum_steps)
+                # Gradient accumulation: fetch accum_steps separate batches
                 acc_grads = None
                 for a_idx in range(accum_steps):
+                    if data_iterator is not None:
+                        if prefetched_train_batch is not None:
+                            batch = prefetched_train_batch
+                            prefetched_train_batch = None
+                        else:
+                            batch = next(data_iterator)
+                        micro_x = jnp.array(batch[0])
+                        micro_y = jnp.array(batch[1])
+                    else:
+                        rng_mock, = jax.random.split(rng[0], 1)
+                        micro_x = jax.random.normal(rng_mock, (args.batch_size, n_patches, patch_dim))
+                        micro_y = jax.random.randint(rng_mock, (args.batch_size,), 0, 1000)
+
+                    micro_x = micro_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
+                    micro_y = micro_y.reshape(num_devices, local_batch_size)
+
                     grads_a, rng = pmapped_grad_step(
-                        state, ema_params, (micro_x[a_idx], micro_y[a_idx]), rng, epoch_rep
+                        state, ema_params, (micro_x, micro_y), rng, epoch_rep
                     )
                     if acc_grads is None:
                         acc_grads = grads_a
