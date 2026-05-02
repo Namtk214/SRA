@@ -307,8 +307,9 @@ class SelfFlowDiT(nn.Module):
 
         zs = None
         block_summaries = [] if return_block_summaries else None
+        RematDiTBlock = nn.remat(DiTBlock)
         for i in range(self.depth):
-            x = DiTBlock(
+            x = RematDiTBlock(
                 hidden_size=self.hidden_size, 
                 num_heads=self.num_heads, 
                 mlp_ratio=self.mlp_ratio,
