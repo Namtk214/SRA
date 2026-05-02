@@ -660,6 +660,53 @@ def train_step(
     return state, ema_params, metrics, rng
 
 
+def grad_step(
+    state,
+    batch,
+    rng,
+    layersync_lambda,
+    *,
+    layersync_enabled,
+    layersync_capture_layers,
+):
+    """Compute gradients only (no optimizer step). For gradient accumulation."""
+    x0, y = batch
+    local_batch = x0.shape[0]
+    rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
+    tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
+    x1 = jax.random.normal(noise_rng, x0.shape)
+    x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
+    target = x0 - x1
+
+    def loss_fn(params):
+        if layersync_enabled:
+            pred, raw_features = state.apply_fn(
+                {"params": params}, x_tau, timesteps=tau, vector=y,
+                deterministic=False, rngs={"dropout": drop_rng},
+                return_raw_features=layersync_capture_layers,
+            )
+            loss_layersync, _ = compute_layersync_loss(raw_features)
+        else:
+            pred = state.apply_fn(
+                {"params": params}, x_tau, timesteps=tau, vector=y,
+                deterministic=False, rngs={"dropout": drop_rng},
+            )
+            loss_layersync = jnp.array(0.0, dtype=jnp.float32)
+        loss_gen = jnp.mean((pred - target) ** 2)
+        return loss_gen + layersync_lambda * loss_layersync
+
+    grads = jax.grad(loss_fn)(state.params)
+    grads = jax.lax.pmean(grads, axis_name="batch")
+    return grads, rng
+
+
+def apply_grads_and_ema(state, ema_params, grads, ema_decay):
+    """Apply accumulated gradients and update EMA. For gradient accumulation."""
+    grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
+    state = state.apply_gradients(grads=grads)
+    ema_params = ema_update(ema_params, state.params, ema_decay)
+    return state, ema_params, grad_norm
+
 def eval_step(
     state,
     ema_params,
@@ -1197,6 +1244,8 @@ def main():
     parser = argparse.ArgumentParser(description="Train vanilla SiT DiT (JAX)")
     # ── Core training args ────────────────────────────────────────────────────
     parser.add_argument("--batch-size", type=int, default=256, help="Global batch size (divided by device count)")
+    parser.add_argument("--grad-accum-steps", type=int, default=1,
+                        help="Gradient accumulation steps. Effective batch = batch_size * grad_accum_steps.")
     parser.add_argument("--model-size", type=str, default="XL", choices=["S", "B", "L", "XL"], help="DiT backbone size: S, B, L, XL")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--steps-per-epoch", type=int, default=1000)
@@ -1427,7 +1476,11 @@ def main():
     if args.batch_size % num_devices != 0:
         raise ValueError(f"--batch-size ({args.batch_size}) must be divisible by device count ({num_devices})")
     local_batch_size = args.batch_size // num_devices
+    accum_steps = args.grad_accum_steps
+    effective_batch = args.batch_size * accum_steps
     log_stage(f"TPU Cores: {num_devices}. Global Batch: {args.batch_size}, Local Batch: {local_batch_size}")
+    if accum_steps > 1:
+        log_stage(f"Gradient accumulation: {accum_steps} steps, effective batch: {effective_batch}")
 
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size)
@@ -1559,6 +1612,16 @@ def main():
         ),
         axis_name="batch",
     )
+    if accum_steps > 1:
+        pmapped_grad_step = jax.pmap(
+            functools.partial(
+                grad_step,
+                layersync_enabled=layersync_enabled,
+                layersync_capture_layers=layersync_capture_layers,
+            ),
+            axis_name="batch",
+        )
+        pmapped_apply_grads = jax.pmap(apply_grads_and_ema, axis_name="batch")
     pmapped_eval_step = jax.pmap(
         functools.partial(
             eval_step,
@@ -2236,9 +2299,23 @@ def main():
             batch_y = batch_y.reshape(num_devices, local_batch_size)
 
             # Vanilla SiT training step (returns updated EMA params)
-            state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, layersync_lambda_rep
-            )
+            if accum_steps <= 1:
+                state, ema_params, metrics, rng = pmapped_train_step(
+                    state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, layersync_lambda_rep
+                )
+            else:
+                micro_x = batch_x.reshape(accum_steps, num_devices, local_batch_size // accum_steps, n_patches, patch_dim)
+                micro_y = batch_y.reshape(accum_steps, num_devices, local_batch_size // accum_steps)
+                acc_grads = None
+                for a_idx in range(accum_steps):
+                    grads_a, rng = pmapped_grad_step(state, (micro_x[a_idx], micro_y[a_idx]), rng, layersync_lambda_rep)
+                    if acc_grads is None:
+                        acc_grads = grads_a
+                    else:
+                        acc_grads = jax.tree_util.tree_map(lambda a, g: a + g, acc_grads, grads_a)
+                acc_grads = jax.tree_util.tree_map(lambda g: g / accum_steps, acc_grads)
+                state, ema_params, grad_norm = pmapped_apply_grads(state, ema_params, acc_grads, ema_decay_rep)
+                metrics = {"train/grad_norm": grad_norm}
             global_step += 1
 
             # ── Periodic checkpoint save ──────────────────────────────────────
