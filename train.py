@@ -12,6 +12,10 @@ import zipfile
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+# Disable Shardy (sdy) dialect — Kaggle TPU plugin may not support it
+os.environ["JAX_USE_SHARDY"] = "0"
+os.environ["ENABLE_SHARDY"] = "0"
+os.environ.setdefault("JAX_PLATFORMS", "tpu,cpu")
 
 
 def log_stage(message):
@@ -403,7 +407,13 @@ import jax
 import jax.numpy as jnp
 import optax
 import wandb
-from flax.training import train_state, checkpoints
+from flax.training import train_state
+try:
+    from flax.training import checkpoints
+except (ImportError, AttributeError):
+    checkpoints = None
+    log_stage("[WARN] flax.training.checkpoints unavailable (orbax version mismatch). "
+              "Using msgpack-based checkpoint fallback.")
 import numpy as np
 try:
     import grain.python as grain
@@ -1124,6 +1134,12 @@ def main():
     parser.add_argument("--steps-per-epoch", type=int, default=1000)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--ckpt-dir", type=str, default="./checkpoints")
+    parser.add_argument("--ckpt-freq", type=int, default=5000,
+                        help="Save checkpoint every N steps (0 = only at end).")
+    parser.add_argument("--ckpt-keep", type=int, default=1,
+                        help="Number of recent checkpoints to keep.")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume training from latest checkpoint in --ckpt-dir.")
     parser.add_argument("--data-path", type=str, required=True, help="Path/glob to training ArrayRecord files")
     parser.add_argument("--val-data-path", type=str, default=None)
     parser.add_argument("--wandb-project", type=str, default="sit-vanilla-jax")
@@ -1279,6 +1295,8 @@ def main():
                              "WARNING: mock batches are not suitable for real training. "
                              "Requires explicit opt-in to prevent silent failures.")
     args = parser.parse_args()
+    # Orbax requires absolute checkpoint paths
+    args.ckpt_dir = os.path.abspath(args.ckpt_dir)
 
     if args.preflight_only:
         args.preflight_checks = True
@@ -1367,6 +1385,66 @@ def main():
     # ── Model, state, EMA ─────────────────────────────────────────────────────
     rng = jax.random.PRNGKey(42)
     state, ema_params = create_train_state(rng, config, args.learning_rate, args.grad_clip)
+
+    # ── Resume from checkpoint if requested ───────────────────────────────────
+    resumed_step = 0
+    if args.resume:
+        import flax.serialization
+
+        # Build template for the full training checkpoint dict
+        train_ckpt_template = {
+            'params': state.params,
+            'opt_state': state.opt_state,
+            'step': 0,
+        }
+
+        restored_ckpt = None
+        # 1. Try msgpack first (most reliable on Kaggle)
+        msgpack_files = sorted(glob.glob(os.path.join(args.ckpt_dir, "checkpoint_*.msgpack")))
+        if msgpack_files:
+            latest = msgpack_files[-1]
+            log_stage(f"Resuming from msgpack: {os.path.basename(latest)}")
+            with open(latest, "rb") as f:
+                restored_ckpt = flax.serialization.from_bytes(train_ckpt_template, f.read())
+            resumed_step = int(restored_ckpt['step'])
+        # 2. Try orbax/flax checkpoints
+        elif checkpoints is not None:
+            try:
+                restored_ckpt = checkpoints.restore_checkpoint(args.ckpt_dir, train_ckpt_template)
+                if restored_ckpt is not train_ckpt_template:
+                    resumed_step = int(restored_ckpt['step'])
+                else:
+                    restored_ckpt = None
+            except Exception as e:
+                log_stage(f"flax.checkpoints restore failed: {e}")
+
+        if restored_ckpt is not None:
+            state = state.replace(
+                params=restored_ckpt['params'],
+                opt_state=restored_ckpt['opt_state'],
+                step=resumed_step,
+            )
+            log_stage(f"Resumed train_state (params + optimizer) at step {resumed_step}")
+
+        # Restore EMA params
+        ema_dir = os.path.join(args.ckpt_dir, "ema")
+        ema_msgpack = sorted(glob.glob(os.path.join(ema_dir, "checkpoint_*.msgpack")))
+        if ema_msgpack:
+            with open(ema_msgpack[-1], "rb") as f:
+                ema_params = flax.serialization.from_bytes(ema_params, f.read())
+            log_stage(f"Resumed EMA params from {ema_dir}")
+        elif checkpoints is not None:
+            try:
+                restored_ema = checkpoints.restore_checkpoint(ema_dir, ema_params)
+                if restored_ema is not ema_params:
+                    ema_params = restored_ema
+                    log_stage(f"Resumed EMA params from {ema_dir}")
+            except Exception:
+                pass
+
+        if resumed_step == 0:
+            log_stage("No checkpoint found, starting fresh.")
+
     state = replicate_to_local_devices(state)
     ema_params = replicate_to_local_devices(ema_params)
     rng = jax.random.split(rng, num_devices)
@@ -2016,12 +2094,46 @@ def main():
             logger.shutdown()
             return
 
+    # ── Checkpoint helpers ─────────────────────────────────────────────────────
+    def _save_ckpt(ckpt_dir, target, step):
+        """Save checkpoint using flax.checkpoints or msgpack fallback."""
+        os.makedirs(ckpt_dir, exist_ok=True)
+        if checkpoints is not None:
+            checkpoints.save_checkpoint(ckpt_dir, target, step, keep=args.ckpt_keep, overwrite=True)
+        else:
+            import flax.serialization
+            path = os.path.join(ckpt_dir, f"checkpoint_{step}.msgpack")
+            with open(path, "wb") as f:
+                f.write(flax.serialization.to_bytes(target))
+            existing = sorted(glob.glob(os.path.join(ckpt_dir, "checkpoint_*.msgpack")))
+            while len(existing) > args.ckpt_keep:
+                os.remove(existing.pop(0))
+
+    def _save_ckpt_full(state, ema_params, step, args):
+        """Save full training state (params + optimizer + step) and EMA params."""
+        unrep_state = unreplicate_from_local_devices(state)
+        unrep_ema = unreplicate_from_local_devices(ema_params)
+        train_ckpt = {
+            'params': unrep_state.params,
+            'opt_state': unrep_state.opt_state,
+            'step': step,
+        }
+        _save_ckpt(args.ckpt_dir, train_ckpt, step)
+        _save_ckpt(os.path.join(args.ckpt_dir, "ema"), unrep_ema, step)
+        log_stage(f"Checkpoint saved at step {step}")
+
     # ── Training loop ─────────────────────────────────────────────────────────
-    global_step = 0
+    global_step = resumed_step
     t0 = time.time()
 
-    for epoch in range(args.epochs):
+    start_epoch = resumed_step // args.steps_per_epoch
+    start_step = resumed_step % args.steps_per_epoch
+
+    for epoch in range(start_epoch, args.epochs):
+        _step_start = start_step if epoch == start_epoch else 0
         for step in range(args.steps_per_epoch):
+            if step < _step_start:
+                continue
             if data_iterator is not None:
                 if prefetched_train_batch is not None:
                     batch = prefetched_train_batch
@@ -2045,6 +2157,10 @@ def main():
                 state, ema_params, (batch_x, batch_y), rng, ema_decay_rep
             )
             global_step += 1
+
+            # ── Periodic checkpoint save ──────────────────────────────────────
+            if args.ckpt_freq > 0 and global_step % args.ckpt_freq == 0:
+                _save_ckpt_full(state, ema_params, global_step, args)
             accumulated_train_tflops += flops_per_train_step / 1e12
 
             # Async metric logging
@@ -2115,20 +2231,8 @@ def main():
                                  args=(latents_dev, sample_classes, global_step),
                                  daemon=True).start()
 
-    # ── Checkpoint save (online params + EMA params) ──────────────────────────
-    os.makedirs(args.ckpt_dir, exist_ok=True)
-    unreplicated_params = unreplicate_from_local_devices(state.params)
-    unreplicated_ema    = unreplicate_from_local_devices(ema_params)
-    checkpoints.save_checkpoint(
-        ckpt_dir=args.ckpt_dir,
-        target=unreplicated_params,
-        step=global_step,
-    )
-    checkpoints.save_checkpoint(
-        ckpt_dir=os.path.join(args.ckpt_dir, "ema"),
-        target=unreplicated_ema,
-        step=global_step,
-    )
+    # ── Final checkpoint save ──────────────────────────────────────────────────
+    _save_ckpt_full(state, ema_params, global_step, args)
     if _flax_decode_cache[0] is not None and isinstance(_flax_decode_cache[0], VAEDecodeSubprocess):
         _flax_decode_cache[0].shutdown()
     if _is_worker[0] is not None:
