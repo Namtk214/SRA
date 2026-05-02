@@ -390,6 +390,7 @@ def build_model_config(model_size):
         num_classes=1001,
         learn_sigma=True,
         compatibility_mode=True,
+        class_dropout_prob=0.0,
     )
 
 
@@ -457,6 +458,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         num_classes=config["num_classes"],
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
+        class_dropout_prob=config["class_dropout_prob"],
         per_token=False,
     )
 
@@ -812,6 +814,7 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         num_classes=config["num_classes"],
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
+        class_dropout_prob=config["class_dropout_prob"],
         per_token=False,
     )
 
@@ -911,6 +914,7 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         num_classes=config["num_classes"],
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
+        class_dropout_prob=config["class_dropout_prob"],
         per_token=False,
     )
 
@@ -1154,6 +1158,8 @@ def main():
     )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
+    parser.add_argument("--cfg-dropout-rate", type=float, default=0.1,
+                        help="Class label dropout probability for CFG training (0 = no CFG).")
     parser.add_argument(
         "--disp",
         action="store_true",
@@ -1352,6 +1358,7 @@ def main():
 
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size)
+    config["class_dropout_prob"] = args.cfg_dropout_rate
     depth = int(config["depth"])
     disp_layer = None
     if args.disp:
@@ -1361,10 +1368,11 @@ def main():
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
-        f"depth={depth} heads={config['num_heads']}"
+        f"depth={depth} heads={config['num_heads']} cfg_dropout={args.cfg_dropout_rate}"
     )
     log_stage(
-        f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
+        f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip} "
+        f"sample_cfg_scale={args.sample_cfg_scale}"
     )
     if args.disp:
         log_stage(
