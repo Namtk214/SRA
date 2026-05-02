@@ -62,6 +62,7 @@ python train.py \
 | `--val-data-path` | `None` | Path/glob to validation ArrayRecord files |
 | `--model-size` | `XL` | DiT backbone: `S`, `B`, `L`, `XL` |
 | `--batch-size` | `256` | Global batch size (divided across devices) |
+| `--grad-accum-steps` | `1` | Gradient accumulation steps. Effective batch = batch_size × accum_steps. |
 | `--epochs` | `100` | Number of training epochs |
 | `--steps-per-epoch` | `1000` | Steps per epoch |
 | `--learning-rate` | `1e-4` | AdamW learning rate |
