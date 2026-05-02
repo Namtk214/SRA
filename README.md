@@ -10,7 +10,7 @@ This branch extends the vanilla SiT backbone with a **Dispersive Loss regularisa
 |---------|-------------|
 | **Flow Matching** | Velocity prediction with uniform timestep sampling (`τ ∈ [0,1]`) |
 | **Dispersive Loss** | Batchwise diversity regulariser on a chosen hidden layer (`--disp --disp-layer`) |
-| **CFG Training** | Class label dropout (`--cfg-dropout-rate 0.1`) for classifier-free guidance |
+| **CFG Training** | Class label dropout (`--cfg-prob 0.1`) for classifier-free guidance |
 | **Periodic Checkpointing** | `--ckpt-freq` / `--ckpt-keep` with automatic cleanup |
 | **Resume Training** | `--resume` restores full state (params + optimizer + step) |
 | **Kaggle TPU Compat** | Shardy dialect disabled, Orbax fallback to msgpack |
@@ -30,7 +30,7 @@ python train.py \
     --epochs 100 \
     --steps-per-epoch 1000 \
     --learning-rate 1e-4 \
-    --cfg-dropout-rate 0.1 \
+    --cfg-prob 0.1 \
     --disp \
     --disp-layer 6 \
     --disp-lambda 0.25 \
@@ -53,7 +53,7 @@ python train.py \
     --data-path /path/to/imagenet_latents/*.ar \
     --model-size B \
     --batch-size 256 \
-    --cfg-dropout-rate 0.1 \
+    --cfg-prob 0.1 \
     --disp \
     --disp-layer 6 \
     --disp-lambda 0.25 \
@@ -78,7 +78,7 @@ python train.py \
 | `--learning-rate` | `1e-4` | AdamW learning rate |
 | `--grad-clip` | `1.0` | Gradient clipping max norm |
 | `--ema-decay` | `0.9999` | EMA decay rate |
-| `--cfg-dropout-rate` | `0.1` | Class label dropout prob for CFG training (`0` = no CFG) |
+| `--cfg-prob` | `0.1` | Class label dropout prob for CFG training (`0` = no CFG) |
 
 ### Model Weights (Kaggle)
 
@@ -157,9 +157,9 @@ The loss is minimised when representations are maximally dispersed (far apart), 
 
 ## CFG (Classifier-Free Guidance) Training
 
-With `--cfg-dropout-rate 0.1`, during training 10% of labels are randomly replaced with a null class token. This enables classifier-free guidance at inference time:
+With `--cfg-prob 0.1`, during training 10% of labels are randomly replaced with a null class token. This enables classifier-free guidance at inference time:
 
-- **Training**: `--cfg-dropout-rate 0.1` (drops 10% of labels)
+- **Training**: `--cfg-prob 0.1` (drops 10% of labels)
 - **Sampling**: `--sample-cfg-scale 1.5` (guidance strength, `1.0` = no guidance)
 - **FID**: `--fid-cfg-scale 1.5` (for FID with guidance)
 

@@ -1158,7 +1158,7 @@ def main():
     )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
-    parser.add_argument("--cfg-dropout-rate", type=float, default=0.1,
+    parser.add_argument("--cfg-prob", type=float, default=0.1,
                         help="Class label dropout probability for CFG training (0 = no CFG).")
     parser.add_argument(
         "--disp",
@@ -1358,7 +1358,7 @@ def main():
 
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size)
-    config["class_dropout_prob"] = args.cfg_dropout_rate
+    config["class_dropout_prob"] = args.cfg_prob
     depth = int(config["depth"])
     disp_layer = None
     if args.disp:
@@ -1368,7 +1368,7 @@ def main():
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
-        f"depth={depth} heads={config['num_heads']} cfg_dropout={args.cfg_dropout_rate}"
+        f"depth={depth} heads={config['num_heads']} cfg_prob={args.cfg_prob}"
     )
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip} "
