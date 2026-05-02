@@ -401,9 +401,10 @@ class SelfFlowDiT(nn.Module):
         block_summaries = [] if return_block_summaries else None
         cached_skip_inputs = [] if self.skip_layer_connection else None
         first_half_depth = self.depth // 2
+        RematDiTBlock = nn.remat(DiTBlock)
         for i in range(self.depth):
             # Run the block first (matches DiverseDiT order: block → skip_norm → skip_linear)
-            x = DiTBlock(
+            x = RematDiTBlock(
                 hidden_size=self.hidden_size, 
                 num_heads=self.num_heads, 
                 mlp_ratio=self.mlp_ratio,
