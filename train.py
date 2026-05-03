@@ -1426,9 +1426,31 @@ def main():
             except Exception as e:
                 log_stage(f"flax.checkpoints restore failed: {e}")
 
+        def _migrate_embedding(params, target_params, label):
+            """Pad/trim LabelEmbedder embedding to match target shape."""
+            try:
+                src_emb = params['LabelEmbedder_0']['Embed_0']['embedding']
+                tgt_emb = target_params['LabelEmbedder_0']['Embed_0']['embedding']
+                if src_emb.shape == tgt_emb.shape:
+                    return params  # no migration needed
+                log_stage(f"Migrating {label} embedding: {src_emb.shape} → {tgt_emb.shape}")
+                if src_emb.shape[0] < tgt_emb.shape[0]:
+                    # Pad with zeros for CFG token
+                    pad_rows = tgt_emb.shape[0] - src_emb.shape[0]
+                    new_emb = jnp.concatenate([src_emb, jnp.zeros((pad_rows, src_emb.shape[1]))], axis=0)
+                else:
+                    # Trim extra rows
+                    new_emb = src_emb[:tgt_emb.shape[0]]
+                p = flax.core.unfreeze(params)
+                p['LabelEmbedder_0']['Embed_0']['embedding'] = new_emb
+                return flax.core.freeze(p)
+            except (KeyError, AttributeError):
+                return params
+
         if restored_ckpt is not None:
+            ckpt_params = _migrate_embedding(restored_ckpt['params'], state.params, "train params")
             state = state.replace(
-                params=restored_ckpt['params'],
+                params=ckpt_params,
                 opt_state=restored_ckpt['opt_state'],
                 step=resumed_step,
             )
@@ -1449,6 +1471,9 @@ def main():
                     log_stage(f"Resumed EMA params from {ema_dir}")
             except Exception:
                 pass
+
+        # Migrate EMA embedding to match model
+        ema_params = _migrate_embedding(ema_params, state.params, "EMA")
 
         if resumed_step == 0:
             log_stage("No checkpoint found, starting fresh.")
