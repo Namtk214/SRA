@@ -1476,8 +1476,25 @@ def main():
                 log_stage(f"flax.checkpoints restore failed: {e}")
 
         if restored_ckpt is not None:
+            # Migrate embedding if checkpoint was trained without CFG but model now has CFG
+            ckpt_params = restored_ckpt['params']
+            try:
+                ckpt_emb = ckpt_params['LabelEmbedder_0']['Embed_0']['embedding']
+                model_emb = state.params['LabelEmbedder_0']['Embed_0']['embedding']
+                if ckpt_emb.shape[0] < model_emb.shape[0]:
+                    pad_rows = model_emb.shape[0] - ckpt_emb.shape[0]
+                    log_stage(f"Migrating LabelEmbedder embedding: {ckpt_emb.shape} → {model_emb.shape} (padding {pad_rows} row(s) for CFG)")
+                    padded = jnp.concatenate([ckpt_emb, jnp.zeros((pad_rows, ckpt_emb.shape[1]))], axis=0)
+                    ckpt_params = flax.core.unfreeze(ckpt_params) if hasattr(ckpt_params, 'unfreeze') else dict(ckpt_params)
+                    ckpt_params['LabelEmbedder_0'] = dict(ckpt_params['LabelEmbedder_0'])
+                    ckpt_params['LabelEmbedder_0']['Embed_0'] = dict(ckpt_params['LabelEmbedder_0']['Embed_0'])
+                    ckpt_params['LabelEmbedder_0']['Embed_0']['embedding'] = padded
+                    ckpt_params = flax.core.freeze(ckpt_params)
+            except (KeyError, AttributeError):
+                pass  # different model structure, skip migration
+
             state = state.replace(
-                params=restored_ckpt['params'],
+                params=ckpt_params,
                 opt_state=restored_ckpt['opt_state'],
                 step=resumed_step,
             )
@@ -1498,6 +1515,22 @@ def main():
                     log_stage(f"Resumed EMA params from {ema_dir}")
             except Exception:
                 pass
+
+        # Migrate EMA embedding for CFG compatibility
+        try:
+            ema_emb = ema_params['LabelEmbedder_0']['Embed_0']['embedding']
+            model_emb = state.params['LabelEmbedder_0']['Embed_0']['embedding']
+            if ema_emb.shape[0] < model_emb.shape[0]:
+                pad_rows = model_emb.shape[0] - ema_emb.shape[0]
+                log_stage(f"Migrating EMA embedding: {ema_emb.shape} → {model_emb.shape}")
+                padded = jnp.concatenate([ema_emb, jnp.zeros((pad_rows, ema_emb.shape[1]))], axis=0)
+                ema_params = flax.core.unfreeze(ema_params) if hasattr(ema_params, 'unfreeze') else dict(ema_params)
+                ema_params['LabelEmbedder_0'] = dict(ema_params['LabelEmbedder_0'])
+                ema_params['LabelEmbedder_0']['Embed_0'] = dict(ema_params['LabelEmbedder_0']['Embed_0'])
+                ema_params['LabelEmbedder_0']['Embed_0']['embedding'] = padded
+                ema_params = flax.core.freeze(ema_params)
+        except (KeyError, AttributeError):
+            pass
 
         if resumed_step == 0:
             log_stage("No checkpoint found, starting fresh.")
