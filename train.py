@@ -608,49 +608,6 @@ def make_train_step(*, disp_enabled=False, disp_layer=None, disp_lambda=0.25):
     return train_step
 
 
-def make_grad_step(*, disp_enabled=False, disp_layer=None, disp_lambda=0.25):
-    """Create a grad-only step function for gradient accumulation."""
-    disp_lambda = jnp.float32(disp_lambda)
-
-    def grad_step_fn(state, batch, rng):
-        x0, y = batch
-        local_batch = x0.shape[0]
-        rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
-        tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
-        x1 = jax.random.normal(noise_rng, x0.shape)
-        x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
-        target = x0 - x1
-
-        def loss_fn(params):
-            model_kwargs = dict(
-                timesteps=tau, vector=y, deterministic=False, rngs={"dropout": drop_rng},
-            )
-            if disp_enabled:
-                pred, disp_features = state.apply_fn(
-                    {"params": params}, x_tau, return_raw_features=disp_layer, **model_kwargs,
-                )
-                disp_loss = compute_disp_loss(disp_features)
-            else:
-                pred = state.apply_fn({"params": params}, x_tau, **model_kwargs)
-                disp_loss = jnp.array(0.0, dtype=jnp.float32)
-            gen_loss = jnp.mean((pred - target) ** 2)
-            return gen_loss + disp_lambda * disp_loss
-
-        grads = jax.grad(loss_fn)(state.params)
-        grads = jax.lax.pmean(grads, axis_name="batch")
-        return grads, rng
-
-    return grad_step_fn
-
-
-def apply_grads_and_ema(state, ema_params, grads, ema_decay):
-    """Apply accumulated gradients and update EMA. For gradient accumulation."""
-    grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
-    state = state.apply_gradients(grads=grads)
-    ema_params = ema_update(ema_params, state.params, ema_decay)
-    return state, ema_params, grad_norm
-
-
 def make_eval_step(*, disp_enabled=False, disp_layer=None, disp_lambda=0.25):
     disp_lambda = jnp.float32(disp_lambda)
 
@@ -1176,8 +1133,6 @@ def main():
     parser = argparse.ArgumentParser(description="Train vanilla SiT DiT (JAX)")
     # ── Core training args ────────────────────────────────────────────────────
     parser.add_argument("--batch-size", type=int, default=256, help="Global batch size (divided by device count)")
-    parser.add_argument("--grad-accum-steps", type=int, default=1,
-                        help="Gradient accumulation steps. Effective batch = batch_size * grad_accum_steps.")
     parser.add_argument("--model-size", type=str, default="XL", choices=["S", "B", "L", "XL"], help="DiT backbone size: S, B, L, XL")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--steps-per-epoch", type=int, default=1000)
@@ -1399,11 +1354,7 @@ def main():
     if args.batch_size % num_devices != 0:
         raise ValueError(f"--batch-size ({args.batch_size}) must be divisible by device count ({num_devices})")
     local_batch_size = args.batch_size // num_devices
-    accum_steps = args.grad_accum_steps
-    effective_batch = args.batch_size * accum_steps
     log_stage(f"TPU Cores: {num_devices}. Global Batch: {args.batch_size}, Local Batch: {local_batch_size}")
-    if accum_steps > 1:
-        log_stage(f"Gradient accumulation: {accum_steps} steps, effective batch: {effective_batch}")
 
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size)
@@ -1476,25 +1427,8 @@ def main():
                 log_stage(f"flax.checkpoints restore failed: {e}")
 
         if restored_ckpt is not None:
-            # Migrate embedding if checkpoint was trained without CFG but model now has CFG
-            ckpt_params = restored_ckpt['params']
-            try:
-                ckpt_emb = ckpt_params['LabelEmbedder_0']['Embed_0']['embedding']
-                model_emb = state.params['LabelEmbedder_0']['Embed_0']['embedding']
-                if ckpt_emb.shape[0] < model_emb.shape[0]:
-                    pad_rows = model_emb.shape[0] - ckpt_emb.shape[0]
-                    log_stage(f"Migrating LabelEmbedder embedding: {ckpt_emb.shape} → {model_emb.shape} (padding {pad_rows} row(s) for CFG)")
-                    padded = jnp.concatenate([ckpt_emb, jnp.zeros((pad_rows, ckpt_emb.shape[1]))], axis=0)
-                    ckpt_params = flax.core.unfreeze(ckpt_params) if hasattr(ckpt_params, 'unfreeze') else dict(ckpt_params)
-                    ckpt_params['LabelEmbedder_0'] = dict(ckpt_params['LabelEmbedder_0'])
-                    ckpt_params['LabelEmbedder_0']['Embed_0'] = dict(ckpt_params['LabelEmbedder_0']['Embed_0'])
-                    ckpt_params['LabelEmbedder_0']['Embed_0']['embedding'] = padded
-                    ckpt_params = flax.core.freeze(ckpt_params)
-            except (KeyError, AttributeError):
-                pass  # different model structure, skip migration
-
             state = state.replace(
-                params=ckpt_params,
+                params=restored_ckpt['params'],
                 opt_state=restored_ckpt['opt_state'],
                 step=resumed_step,
             )
@@ -1515,22 +1449,6 @@ def main():
                     log_stage(f"Resumed EMA params from {ema_dir}")
             except Exception:
                 pass
-
-        # Migrate EMA embedding for CFG compatibility
-        try:
-            ema_emb = ema_params['LabelEmbedder_0']['Embed_0']['embedding']
-            model_emb = state.params['LabelEmbedder_0']['Embed_0']['embedding']
-            if ema_emb.shape[0] < model_emb.shape[0]:
-                pad_rows = model_emb.shape[0] - ema_emb.shape[0]
-                log_stage(f"Migrating EMA embedding: {ema_emb.shape} → {model_emb.shape}")
-                padded = jnp.concatenate([ema_emb, jnp.zeros((pad_rows, ema_emb.shape[1]))], axis=0)
-                ema_params = flax.core.unfreeze(ema_params) if hasattr(ema_params, 'unfreeze') else dict(ema_params)
-                ema_params['LabelEmbedder_0'] = dict(ema_params['LabelEmbedder_0'])
-                ema_params['LabelEmbedder_0']['Embed_0'] = dict(ema_params['LabelEmbedder_0']['Embed_0'])
-                ema_params['LabelEmbedder_0']['Embed_0']['embedding'] = padded
-                ema_params = flax.core.freeze(ema_params)
-        except (KeyError, AttributeError):
-            pass
 
         if resumed_step == 0:
             log_stage("No checkpoint found, starting fresh.")
@@ -1573,14 +1491,6 @@ def main():
         disp_lambda=args.disp_lambda,
     )
     pmapped_train_step = jax.pmap(train_step_fn, axis_name="batch")
-    if accum_steps > 1:
-        grad_step_fn = make_grad_step(
-            disp_enabled=args.disp,
-            disp_layer=disp_layer,
-            disp_lambda=args.disp_lambda,
-        )
-        pmapped_grad_step = jax.pmap(grad_step_fn, axis_name="batch")
-        pmapped_apply_grads = jax.pmap(apply_grads_and_ema, axis_name="batch")
     pmapped_eval_step = jax.pmap(eval_step_fn, axis_name="batch")
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
@@ -2232,54 +2142,28 @@ def main():
         for step in range(args.steps_per_epoch):
             if step < _step_start:
                 continue
-            # Vanilla SiT training step (returns updated EMA params)
-            if accum_steps <= 1:
-                if data_iterator is not None:
-                    if prefetched_train_batch is not None:
-                        batch = prefetched_train_batch
-                        prefetched_train_batch = None
-                    else:
-                        batch = next(data_iterator)
-                    batch_x = jnp.array(batch[0])
-                    batch_y = jnp.array(batch[1])
+            if data_iterator is not None:
+                if prefetched_train_batch is not None:
+                    batch = prefetched_train_batch
+                    prefetched_train_batch = None
                 else:
-                    rng_mock, = jax.random.split(rng[0], 1)
-                    batch_x = jax.random.normal(rng_mock, (args.batch_size, n_patches, patch_dim))
-                    batch_y = jax.random.randint(rng_mock, (args.batch_size,), 0, 1000)
-
-                batch_x = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
-                batch_y = batch_y.reshape(num_devices, local_batch_size)
-
-                state, ema_params, metrics, rng = pmapped_train_step(
-                    state, ema_params, (batch_x, batch_y), rng, ema_decay_rep
-                )
+                    batch = next(data_iterator)
+                batch_x = jnp.array(batch[0])
+                batch_y = jnp.array(batch[1])
             else:
-                all_grads = []
-                for a_idx in range(accum_steps):
-                    if data_iterator is not None:
-                        if prefetched_train_batch is not None:
-                            batch = prefetched_train_batch
-                            prefetched_train_batch = None
-                        else:
-                            batch = next(data_iterator)
-                        micro_x = jnp.array(batch[0])
-                        micro_y = jnp.array(batch[1])
-                    else:
-                        rng_mock, = jax.random.split(rng[0], 1)
-                        micro_x = jax.random.normal(rng_mock, (args.batch_size, n_patches, patch_dim))
-                        micro_y = jax.random.randint(rng_mock, (args.batch_size,), 0, 1000)
+                # Mock fallback: only reaches here if --mock-data was explicitly set
+                rng_mock, = jax.random.split(rng[0], 1)
+                batch_x = jax.random.normal(rng_mock, (args.batch_size, n_patches, patch_dim))
+                batch_y = jax.random.randint(rng_mock, (args.batch_size,), 0, 1000)
 
-                    micro_x = micro_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
-                    micro_y = micro_y.reshape(num_devices, local_batch_size)
+            # Reshape for SPMD: (Global, ...) → (Devices, Local, ...)
+            batch_x = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
+            batch_y = batch_y.reshape(num_devices, local_batch_size)
 
-                    grads_a, rng = pmapped_grad_step(state, (micro_x, micro_y), rng)
-                    all_grads.append(grads_a)
-                acc_grads = all_grads[0]
-                for g in all_grads[1:]:
-                    acc_grads = jax.tree_util.tree_map(jnp.add, acc_grads, g)
-                acc_grads = jax.tree_util.tree_map(lambda g: g / accum_steps, acc_grads)
-                state, ema_params, grad_norm = pmapped_apply_grads(state, ema_params, acc_grads, ema_decay_rep)
-                metrics = {"train/grad_norm": grad_norm}
+            # Vanilla SiT training step (returns updated EMA params)
+            state, ema_params, metrics, rng = pmapped_train_step(
+                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep
+            )
             global_step += 1
 
             # ── Periodic checkpoint save ──────────────────────────────────────
