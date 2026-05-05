@@ -173,7 +173,7 @@ def build_sample_step_pmap(model, vae, scale_factor, shift_factor, use_cfg=False
         noise = jax.random.normal(
             noise_rng,
             (batch_size_per_device, latent_channels, latent_size, latent_size),
-            dtype=jnp.bfloat16
+            dtype=jnp.float32
         )
 
         x = rearrange(
@@ -200,12 +200,14 @@ def build_sample_step_pmap(model, vae, scale_factor, shift_factor, use_cfg=False
             )
 
         rng, denoise_rng = jax.random.split(rng)
+        # cfg_scale: pass None when no CFG to avoid tracer bool error in denoise_loop
+        effective_cfg = cfg_scale if use_cfg else None
         samples = denoise_loop(
             model_fn=model_fn,
             x=x,
             rng=denoise_rng,
             num_steps=num_steps,
-            cfg_scale=cfg_scale,
+            cfg_scale=effective_cfg,
             guidance_low=guidance_low,
             guidance_high=guidance_high,
             mode="SDE",
