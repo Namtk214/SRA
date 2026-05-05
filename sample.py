@@ -2,15 +2,22 @@
 """
 Sample images from a trained Self-Flow diffusion model (JAX/Flax).
 
-Usage:
-    python sample.py --ckpt path/to/checkpoint --output-dir ./samples
+Optimized for TPU v5p-8 (8 cores):
+  - jax.pmap across all TPU cores for 8x throughput
+  - bfloat16 for TPU-native compute
+  - Orbax checkpoint loading (TPU-trained checkpoints)
+  - Static CFG branching to avoid tracing errors
 
-This script generates images for FID evaluation, outputting an NPZ file
-compatible with the ADM evaluation suite.
+Usage (Kaggle TPU v5p-8):
+    python sample.py --ckpt path/to/ema/checkpoint_420000 \
+        --model-size B --num-fid-samples 50000 --batch-size 64
+
+Output: NPZ file compatible with ADM evaluation suite.
 """
 
 import os
 import math
+import time
 import argparse
 import functools
 from pathlib import Path
@@ -23,8 +30,6 @@ from tqdm import tqdm
 from einops import rearrange
 import collections.abc
 
-# Import from local src/ folder
-from flax.training import checkpoints as flax_ckpt
 from src.model import SelfFlowDiT
 from src.sampling import denoise_loop
 
@@ -40,7 +45,7 @@ DEFAULT_CFG_DROPOUT_RATE = 0.1
 
 
 def _model_config_for_size(model_size, cfg_dropout_rate=DEFAULT_CFG_DROPOUT_RATE):
-    """Return the full model-init config dict for a DiT variant name (S/B/L/XL)."""
+    """Return the full model-init config dict for a DiT variant name."""
     variant = DIT_VARIANTS[model_size.upper()]
     return dict(
         input_size=32,
@@ -59,7 +64,6 @@ def _model_config_for_size(model_size, cfg_dropout_rate=DEFAULT_CFG_DROPOUT_RATE
 
 def create_npz_from_samples(samples, output_path):
     """Save samples to NPZ file for ADM evaluation."""
-    samples = np.stack(samples, axis=0)
     np.savez(output_path, arr_0=samples)
     print(f"Saved {len(samples)} samples to {output_path}")
 
@@ -78,13 +82,13 @@ def load_vae(vae_model="stabilityai/sd-vae-ft-mse", dtype=jnp.bfloat16):
     return vae, vae_params, scale_factor, shift_factor
 
 
-def load_model(ckpt_path=None, model_size="XL", cfg_dropout_rate=DEFAULT_CFG_DROPOUT_RATE):
-    """Load the DiT backbone from a flax.training.checkpoints checkpoint.
+def load_model(ckpt_path=None, model_size="B", cfg_dropout_rate=DEFAULT_CFG_DROPOUT_RATE):
+    """Load the DiT backbone from an Orbax checkpoint (TPU-trained).
 
-    This SiT baseline expects flat parameter trees (both online and EMA).
-    For convenience, we also tolerate a few older shapes when loading:
-      - Nested {"backbone": ...} checkpoints: extract "backbone".
-      - Flat checkpoints that include a legacy "feature_head": drop that key.
+    Handles:
+      - TPU sharding → single/multi-device re-sharding
+      - DiTBlock_* ↔ CheckpointDiTBlock_* key remapping (nn.remat)
+      - Skipping feature_head / SimpleHead (not needed for sampling)
     """
     config = _model_config_for_size(model_size, cfg_dropout_rate=cfg_dropout_rate)
     model = SelfFlowDiT(**config, per_token=False)
@@ -103,28 +107,60 @@ def load_model(ckpt_path=None, model_size="XL", cfg_dropout_rate=DEFAULT_CFG_DRO
     if ckpt_path is not None and os.path.exists(ckpt_path):
         print(f"Loading checkpoint from {ckpt_path}")
 
-        raw = flax_ckpt.restore_checkpoint(ckpt_dir=ckpt_path, target=None)
-        if raw is not None:
-            if isinstance(raw, collections.abc.Mapping) and "backbone" in raw:
-                raw = dict(raw["backbone"])
-            elif isinstance(raw, collections.abc.Mapping) and "feature_head" in raw:
-                raw = {k: v for k, v in raw.items() if k != "feature_head"}
-            params = raw
-    
+        import orbax.checkpoint as ocp
+
+        # Build target tree: remap CheckpointDiTBlock → DiTBlock for ckpt
+        ckpt_target = {}
+        for k, v in params.items():
+            if k in ('SimpleHead_0', 'feature_head'):
+                continue
+            ck = k.replace('CheckpointDiTBlock_', 'DiTBlock_') if k.startswith('CheckpointDiTBlock_') else k
+            ckpt_target[ck] = v
+
+        # Use first device for restore, replicate later
+        sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+        restore_args = jax.tree_util.tree_map(
+            lambda x: ocp.ArrayRestoreArgs(
+                sharding=sharding, global_shape=x.shape, dtype=x.dtype),
+            ckpt_target)
+
+        restored = ocp.PyTreeCheckpointer().restore(
+            ckpt_path, item=ckpt_target, restore_args=restore_args)
+
+        # Remap DiTBlock → CheckpointDiTBlock and merge back
+        target_keys = set(params.keys())
+        for k, val in restored.items():
+            new_key = k
+            if k.startswith('DiTBlock_') and k not in target_keys:
+                new_key = k.replace('DiTBlock_', 'CheckpointDiTBlock_')
+            if new_key in target_keys:
+                params[new_key] = val
+
+        total = sum(v.size for v in jax.tree_util.tree_leaves(params))
+        print(f"Loaded {total:,} parameters")
+
     return model, params
 
 
-def build_sample_step(model, vae, scale_factor, shift_factor):
-    """Build JIT-compiled sampling function."""
-    
-    @functools.partial(jax.jit, static_argnames=("batch_size", "num_steps"))
-    def sample_batch_jit(
+def build_sample_step_pmap(model, vae, scale_factor, shift_factor, use_cfg=False):
+    """Build pmap-compiled sampling function for multi-device TPU.
+
+    Args:
+        use_cfg: Static bool — whether to use classifier-free guidance.
+                 Must be set at build time to avoid tracer errors.
+    """
+
+    @functools.partial(jax.pmap, static_broadcasted_argnums=(4, 5),
+                       axis_name="devices")
+    def sample_batch_pmap(
         params,
         vae_params,
         rng,
         class_labels,
-        batch_size,
+        # static:
+        batch_size_per_device,
         num_steps,
+        # traced (per-device):
         cfg_scale,
         guidance_low,
         guidance_high,
@@ -132,15 +168,14 @@ def build_sample_step(model, vae, scale_factor, shift_factor):
         latent_channels = 4
         latent_size = 32
         patch_size = 2
-        
+
         rng, noise_rng = jax.random.split(rng)
         noise = jax.random.normal(
-            noise_rng, 
-            (batch_size, latent_channels, latent_size, latent_size),
+            noise_rng,
+            (batch_size_per_device, latent_channels, latent_size, latent_size),
             dtype=jnp.bfloat16
         )
-        
-        # Patchify matching the training dataloader: each token in (p1 p2 c) order.
+
         x = rearrange(
             noise,
             "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
@@ -148,16 +183,14 @@ def build_sample_step(model, vae, scale_factor, shift_factor):
         )
         token_h = latent_size // patch_size
         token_w = latent_size // patch_size
-        
-        # Enable CFG
-        use_cfg = cfg_scale > 1.0
+
+        # CFG: static branch (no tracer issue)
         if use_cfg:
             x = jnp.concatenate([x, x], axis=0)
             null_labels = jnp.full_like(class_labels, 1000)
             class_labels = jnp.concatenate([null_labels, class_labels], axis=0)
-            
+
         def model_fn(z_x, t):
-            # z_x has dynamic shape inside compilation, but tracing fixes it
             return model.apply(
                 {"params": params},
                 z_x,
@@ -165,7 +198,7 @@ def build_sample_step(model, vae, scale_factor, shift_factor):
                 vector=class_labels,
                 deterministic=True
             )
-            
+
         rng, denoise_rng = jax.random.split(rng)
         samples = denoise_loop(
             model_fn=model_fn,
@@ -178,120 +211,224 @@ def build_sample_step(model, vae, scale_factor, shift_factor):
             mode="SDE",
             reverse=False,
         )
-        
+
         if use_cfg:
-            samples = samples[batch_size:]
-        
-        # Unpatchify: inverse of (p1 p2 c) train patchify → NCHW latent.
+            samples = samples[batch_size_per_device:]
+
+        # Unpatchify → NCHW latent
         samples = rearrange(
             samples,
             "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
             h=token_h, w=token_w,
             p1=patch_size, p2=patch_size, c=latent_channels
         )
-        
-        # Decode latents using VAE
+
+        # VAE decode
         latents = samples / scale_factor + shift_factor
-        latents = jnp.transpose(latents, (0, 2, 3, 1))  # (B, H, W, C)
-        
+        latents = jnp.transpose(latents, (0, 2, 3, 1))  # NCHW → NHWC
+
         images = vae.apply({"params": vae_params}, latents, method=vae.decode).sample
-        images = jnp.transpose(images, (0, 2, 3, 1))  # Diffusers Flax VAE decode returns NCHW
+        images = jnp.transpose(images, (0, 2, 3, 1))  # NCHW → NHWC
         images = (images + 1.0) / 2.0
         images = jnp.clip(images, 0.0, 1.0)
-        
         images = (images * 255.0).astype(jnp.uint8)
+
         return images
-        
-    return sample_batch_jit
+
+    return sample_batch_pmap
+
+
+def replicate(tree, num_devices):
+    """Replicate a pytree across devices for pmap."""
+    return jax.tree_util.tree_map(
+        lambda x: jnp.broadcast_to(x, (num_devices,) + x.shape).copy(),
+        tree)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Sample images from vanilla SiT model (JAX)")
+    parser = argparse.ArgumentParser(
+        description="Sample images from SiT model (JAX) — TPU v5p-8 optimized")
     parser.add_argument("--ckpt", type=str, default=None, help="Path to model checkpoint")
     parser.add_argument("--output-dir", type=str, default="./samples", help="Output directory")
-    parser.add_argument("--num-fid-samples", type=int, default=50000, help="Number of samples to generate")
-    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
+    parser.add_argument("--num-fid-samples", type=int, default=50000,
+                        help="Number of samples to generate")
+    parser.add_argument("--batch-size", type=int, default=64,
+                        help="Batch size PER DEVICE (total = batch_size × num_devices)")
     parser.add_argument("--num-steps", type=int, default=250, help="Number of diffusion steps")
     parser.add_argument("--mode", type=str, default="SDE", choices=["SDE"], help="Sampling mode")
     parser.add_argument("--seed", type=int, default=31, help="Random seed")
-    parser.add_argument("--save-images", action="store_true", default=True, help="Save individual PNG images")
-    parser.add_argument("--no-save-images", action="store_false", dest="save_images")
-    parser.add_argument("--model-size", type=str, default="XL", choices=["S", "B", "L", "XL"], help="DiT backbone size: S, B, L, XL")
+    parser.add_argument("--save-images", action="store_true", default=False,
+                        help="Save individual PNG images (slow, disabled by default)")
+    parser.add_argument("--model-size", type=str, default="B",
+                        choices=["S", "B", "L", "XL"], help="DiT backbone size")
     parser.add_argument("--vae-model", type=str, default="stabilityai/sd-vae-ft-mse",
                         choices=["stabilityai/sd-vae-ft-mse", "stabilityai/sd-vae-ft-ema"],
                         help="HuggingFace VAE model ID")
-    parser.add_argument("--cfg-scale", type=float, default=1.0, help="CFG scale (1.0 = no guidance)")
+    parser.add_argument("--cfg-scale", type=float, default=1.0,
+                        help="CFG scale (1.0 = no guidance)")
     parser.add_argument("--cfg-dropout-rate", type=float, default=DEFAULT_CFG_DROPOUT_RATE,
-                        help="CFG class dropout rate used when training the checkpoint. Use 0.0 for no-CFG-dropout checkpoints.")
-    parser.add_argument("--no-cfg-dropout", dest="cfg_dropout_rate", action="store_const", const=0.0,
-                        help="Shortcut for --cfg-dropout-rate 0.0.")
-    parser.add_argument("--guidance-low", type=float, default=0.0, help="Lower guidance bound")
-    parser.add_argument("--guidance-high", type=float, default=0.7, help="Upper guidance bound")
+                        help="CFG class dropout rate used during training")
+    parser.add_argument("--no-cfg-dropout", dest="cfg_dropout_rate",
+                        action="store_const", const=0.0)
+    parser.add_argument("--guidance-low", type=float, default=0.0)
+    parser.add_argument("--guidance-high", type=float, default=0.7)
+    parser.add_argument("--ref-batch", type=str, default=None,
+                        help="Path to reference NPZ for automatic FID evaluation")
     args = parser.parse_args()
 
     if not 0.0 <= args.cfg_dropout_rate < 1.0:
         raise ValueError("--cfg-dropout-rate must be in [0.0, 1.0)")
     if args.cfg_dropout_rate <= 0.0 and args.cfg_scale > 1.0:
-        raise ValueError("--cfg-scale > 1 requires a checkpoint trained with --cfg-dropout-rate > 0")
-    
-    print(f"Generating {args.num_fid_samples} samples")
-    print(f"Mode: {args.mode}, Steps: {args.num_steps}, CFG: {args.cfg_scale}")
-    
+        raise ValueError("--cfg-scale > 1 requires --cfg-dropout-rate > 0")
+
+    # ── Device setup ─────────────────────────────────────────────────────
+    num_devices = jax.device_count()
+    local_devices = jax.local_devices()
+    print(f"=== SiT-{args.model_size} Sampler (TPU-optimized pmap) ===")
+    print(f"Devices: {num_devices}x {local_devices[0].platform.upper()}")
+    print(f"Batch: {args.batch_size}/device × {num_devices} devices "
+          f"= {args.batch_size * num_devices} total/iter")
+    print(f"Samples: {args.num_fid_samples}, Steps: {args.num_steps}, "
+          f"CFG: {args.cfg_scale}")
+
+    # ── Load model & VAE ─────────────────────────────────────────────────
+    model, params = load_model(
+        args.ckpt, model_size=args.model_size,
+        cfg_dropout_rate=args.cfg_dropout_rate)
+    vae, vae_params, scale_factor, shift_factor = load_vae(
+        vae_model=args.vae_model)
+
+    # Replicate params across all devices
+    print(f"Replicating params to {num_devices} devices...")
+    params_rep = replicate(params, num_devices)
+    vae_params_rep = replicate(vae_params, num_devices)
+
+    # ── Build pmap function ──────────────────────────────────────────────
+    use_cfg = args.cfg_scale > 1.0
+    sample_fn = build_sample_step_pmap(
+        model, vae, scale_factor, shift_factor, use_cfg=use_cfg)
+
+    # ── JIT warmup ───────────────────────────────────────────────────────
+    bs_per_device = args.batch_size
+    total_per_iter = bs_per_device * num_devices
+    total_samples = args.num_fid_samples
+    num_batches = math.ceil(total_samples / total_per_iter)
+
+    print(f"\nJIT compiling (first batch)... This may take a few minutes.")
+    t_compile = time.time()
+
     rng = jax.random.PRNGKey(args.seed)
-    
-    # Create output directory
+    rng, warmup_rng = jax.random.split(rng)
+    # Per-device RNGs
+    warmup_rngs = jax.random.split(warmup_rng, num_devices)
+    warmup_labels = jax.random.randint(
+        jax.random.PRNGKey(0), (num_devices, bs_per_device), 0, 1000)
+
+    # Broadcast scalar args to per-device
+    cfg_arr = jnp.full((num_devices,), args.cfg_scale)
+    glow_arr = jnp.full((num_devices,), args.guidance_low)
+    ghigh_arr = jnp.full((num_devices,), args.guidance_high)
+
+    warmup_images = sample_fn(
+        params_rep, vae_params_rep, warmup_rngs, warmup_labels,
+        bs_per_device, args.num_steps,
+        cfg_arr, glow_arr, ghigh_arr)
+    jax.block_until_ready(warmup_images)
+
+    compile_time = time.time() - t_compile
+    print(f"  Compiled in {compile_time:.1f}s")
+
+    # ── Sampling loop ────────────────────────────────────────────────────
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     if args.save_images:
         (output_dir / "images").mkdir(exist_ok=True)
-        
-    model, params = load_model(args.ckpt, model_size=args.model_size, cfg_dropout_rate=args.cfg_dropout_rate)
-    vae, vae_params, scale_factor, shift_factor = load_vae(vae_model=args.vae_model)
-    
-    sample_step_fn = build_sample_step(model, vae, scale_factor, shift_factor)
-    
-    total_samples = args.num_fid_samples
-    num_batches = math.ceil(total_samples / args.batch_size)
-    
+
     all_samples = []
-    
-    for batch_idx in tqdm(range(num_batches), desc="Sampling"):
-        batch_start = batch_idx * args.batch_size
-        batch_end = min(batch_start + args.batch_size, total_samples)
-        needed = batch_end - batch_start
-        
+    generated = 0
+
+    # Use warmup batch as first batch
+    first_images = np.asarray(warmup_images)  # (num_devices, bs, 256, 256, 3)
+    first_images = first_images.reshape(-1, 256, 256, 3)
+    needed = min(total_per_iter, total_samples)
+    all_samples.append(first_images[:needed])
+    generated += needed
+
+    print(f"\nSampling {total_samples} images in {num_batches} iterations "
+          f"({total_per_iter} imgs/iter)...")
+    t_start = time.time()
+
+    for batch_idx in tqdm(range(1, num_batches), desc="Sampling"):
+        needed = min(total_per_iter, total_samples - generated)
+
         rng, class_rng, step_rng = jax.random.split(rng, 3)
-        # Keep JIT shapes static: always run with the full batch size, then slice.
-        class_labels = jax.random.randint(class_rng, (args.batch_size,), 0, 1000)
-        
-        images = sample_step_fn(
-            params=params,
-            vae_params=vae_params,
-            rng=step_rng,
-            class_labels=class_labels,
-            batch_size=args.batch_size,
-            num_steps=args.num_steps,
-            cfg_scale=args.cfg_scale,
-            guidance_low=args.guidance_low,
-            guidance_high=args.guidance_high,
-        )
-        
-        # JAX arrays to NumPy
-        images_np = np.asarray(images)[:needed]
+        # Per-device RNGs and labels
+        step_rngs = jax.random.split(step_rng, num_devices)
+        class_labels = jax.random.randint(
+            class_rng, (num_devices, bs_per_device), 0, 1000)
+
+        images = sample_fn(
+            params_rep, vae_params_rep, step_rngs, class_labels,
+            bs_per_device, args.num_steps,
+            cfg_arr, glow_arr, ghigh_arr)
+
+        images_np = np.asarray(images).reshape(-1, 256, 256, 3)[:needed]
         all_samples.append(images_np)
-        
+        generated += needed
+
         if args.save_images:
+            offset = generated - needed
             for i, img in enumerate(images_np):
-                global_idx = batch_start + i
-                Image.fromarray(img).save(output_dir / "images" / f"{global_idx:06d}.png")
-                
-    all_samples = np.concatenate(all_samples, axis=0)
-    all_samples = all_samples[:args.num_fid_samples]
-    
-    npz_path = output_dir / f"samples_{len(all_samples)}.npz"
-    create_npz_from_samples(list(all_samples), npz_path)
-    
-    print(f"Done! NPZ saved at: {npz_path}")
+                Image.fromarray(img).save(
+                    output_dir / "images" / f"{offset + i:06d}.png")
+
+    elapsed = time.time() - t_start
+    total_time = compile_time + elapsed
+    print(f"\nDone! Total: {total_time/60:.1f} min "
+          f"(compile: {compile_time:.0f}s, sampling: {elapsed/60:.1f} min)")
+    if generated > total_per_iter:
+        print(f"Speed: {elapsed/(generated - total_per_iter):.4f} s/img (post-compile)")
+
+    all_samples = np.concatenate(all_samples, axis=0)[:total_samples]
+    npz_path = output_dir / f"samples_{total_samples}.npz"
+    create_npz_from_samples(all_samples, npz_path)
+    print(f"Shape: {all_samples.shape}, dtype: {all_samples.dtype}")
+
+    # ── Auto FID evaluation ──────────────────────────────────────────────
+    if args.ref_batch and os.path.exists(args.ref_batch):
+        print(f"\n{'='*60}")
+        print(f"Running ADM FID evaluation...")
+        print(f"  Reference: {args.ref_batch}")
+        print(f"  Samples:   {npz_path}")
+        print(f"{'='*60}")
+        import subprocess
+        evaluator_candidates = [
+            "/workspace/guided-diffusion/evaluations/evaluator.py",
+            "./guided-diffusion/evaluations/evaluator.py",
+            "../guided-diffusion/evaluations/evaluator.py",
+        ]
+        evaluator_path = None
+        for p in evaluator_candidates:
+            if os.path.exists(p):
+                evaluator_path = p
+                break
+        if evaluator_path:
+            result = subprocess.run(
+                ["python3", evaluator_path, args.ref_batch, str(npz_path)],
+                capture_output=True, text=True)
+            # Print only metric lines
+            for line in (result.stdout + result.stderr).split('\n'):
+                if any(k in line for k in
+                       ['FID', 'sFID', 'Inception Score', 'Precision', 'Recall']):
+                    print(line)
+            print(f"\n{'='*60}")
+            print("EVALUATION COMPLETE")
+            print(f"{'='*60}")
+        else:
+            print("WARNING: evaluator.py not found. Run FID evaluation manually.")
+    elif args.ref_batch:
+        print(f"WARNING: --ref-batch file not found: {args.ref_batch}")
+
 
 if __name__ == "__main__":
     main()
