@@ -63,7 +63,10 @@ def safe_wandb_log(metrics, step=None):
 # Deliberately has NO import of train.py and NO import of jax/flax so the
 # child process is free of JAX/TPU and can load torch+diffusers cleanly.
 _VAE_WORKER_SCRIPT = """\
-import sys, struct, pickle, os, zipfile, tempfile, json
+import os
+os.environ["JAX_PLATFORMS"] = "cpu"
+os.environ["JAX_PLATFORM_NAME"] = "cpu"
+import sys, struct, pickle, zipfile, tempfile, json
 import numpy as np
 import torch
 from diffusers import AutoencoderKL
@@ -98,9 +101,14 @@ try:
         zip_files = sorted(
             os.path.join(vae_path, f) for f in os.listdir(vae_path) if f.endswith(".zip")
         )
-        if os.path.exists(flax_msgpack):
-            # Standard HF Flax format (config.json + flax_model.msgpack)
-            vae = AutoencoderKL.from_pretrained(vae_path, from_flax=True, torch_dtype=torch.float32).eval()
+        msgpack_files = [f for f in os.listdir(vae_path) if f.endswith(".msgpack")]
+        if msgpack_files:
+            chosen_msgpack = os.path.join(vae_path, msgpack_files[0])
+            config = AutoencoderKL.load_config(vae_path)
+            vae = AutoencoderKL.from_config(config, torch_dtype=torch.float32)
+            from diffusers.models.modeling_pytorch_flax_utils import load_flax_checkpoint_in_pytorch_model
+            vae = load_flax_checkpoint_in_pytorch_model(vae, chosen_msgpack)
+            vae.eval()
         elif zip_files:
             # Custom zip format từ prepare_data_tpu.py save_vae_params()
             vae = _load_from_flax_zip(zip_files[0], hf_config_id)
@@ -159,13 +167,12 @@ class VAEDecodeSubprocess:
             [sys.executable, "-c", _VAE_WORKER_SCRIPT, vae_model, vae_hf_config],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,  # Avoid deadlock: from_flax fills stderr pipe buffer
         )
         ready = self._proc.stdout.readline().strip()
         if ready != b"READY":
-            err = self._proc.stderr.read(4096).decode(errors="replace")
             raise RuntimeError(
-                f"VAE worker failed to start.\nstdout: {ready!r}\nstderr: {err}"
+                f"VAE worker failed to start.\nstdout: {ready!r}"
             )
 
     def decode(self, latents_nchw):
@@ -791,7 +798,12 @@ def get_arrayrecord_dataloader(data_pattern, batch_size, is_training=True, seed=
         def map(self, record_bytes):
             parsed = pickle.loads(record_bytes)
 
-            latent = parsed["latent"] # numpy array shape: (4, 32, 32)
+            if "latent" in parsed:
+                latent = parsed["latent"]     # (4, 32, 32)
+            elif "moments" in parsed:
+                latent = parsed["moments"][:4]  # Use raw mean from (8, 32, 32)
+            else:
+                raise KeyError(f"Record has neither 'latent' nor 'moments'. Keys: {list(parsed.keys())}")
             label = parsed["label"]
 
             # Patchify the latent to DiT input (256, 16)
@@ -1513,68 +1525,379 @@ def main():
         wandb.define_metric("*", step_metric="train/step")
     logger = AsyncWandbLogger(enabled=not args.no_wandb)
 
-    # ── Model, state, EMA ─────────────────────────────────────────────────────
-    rng = jax.random.PRNGKey(42)
-    state, ema_params = create_train_state(rng, config, args.learning_rate, args.grad_clip)
+    # ── Helper: align checkpoint keys (CheckpointDiTBlock ↔ DiTBlock) ────────
+    def _align_keys(d, reference_keys):
+        """Recursively rename checkpoint keys to match the model's param structure.
 
-    # ── Resume from checkpoint if requested ───────────────────────────────────
+        Flax nn.remat wraps DiTBlock → CheckpointDiTBlock. Checkpoints saved
+        with/without remat will have mismatched keys. This function detects the
+        direction of mismatch and renames accordingly.
+        """
+        if not isinstance(d, dict):
+            return d
+        new_d = {}
+        for k, v in d.items():
+            new_key = k
+            if k.startswith("CheckpointDiTBlock_"):
+                plain_key = k.replace("CheckpointDiTBlock_", "DiTBlock_", 1)
+                if plain_key in reference_keys and k not in reference_keys:
+                    new_key = plain_key
+            elif k.startswith("DiTBlock_"):
+                remat_key = k.replace("DiTBlock_", "CheckpointDiTBlock_", 1)
+                if remat_key in reference_keys and k not in reference_keys:
+                    new_key = remat_key
+            # Recurse into nested dicts; pass child reference keys if available
+            child_ref = reference_keys
+            if isinstance(reference_keys, dict) and new_key in reference_keys:
+                child_val = reference_keys[new_key]
+                if isinstance(child_val, dict):
+                    child_ref = child_val
+                elif hasattr(child_val, 'keys'):
+                    child_ref = dict(child_val)
+            new_d[new_key] = _align_keys(v, child_ref)
+        return new_d
+
+    def _harmonize_num_classes(ckpt_params, model_params):
+        """Auto-detect and fix num_classes mismatch in LabelEmbedder embedding.
+
+        If the checkpoint was saved with a different num_classes (e.g. 1001 for
+        CFG dropout vs 1000), crop or pad the embedding table to match.
+        """
+        def _find_label_embedding(p, path=""):
+            """Walk the param tree to find the LabelEmbedder's Embed_0 embedding."""
+            if not isinstance(p, dict):
+                return None, None
+            for k, v in p.items():
+                full = f"{path}/{k}"
+                if k == "LabelEmbedder_0":
+                    embed = v.get("Embed_0", {}).get("embedding", None)
+                    if embed is not None:
+                        return embed, full + "/Embed_0/embedding"
+                result, rpath = _find_label_embedding(v, full)
+                if result is not None:
+                    return result, rpath
+            return None, None
+
+        ckpt_emb, ckpt_path = _find_label_embedding(ckpt_params)
+        model_emb, model_path = _find_label_embedding(model_params)
+
+        if ckpt_emb is None or model_emb is None:
+            return ckpt_params  # Can't find embedding — skip
+
+        ckpt_nc = ckpt_emb.shape[0]
+        model_nc = model_emb.shape[0]
+
+        if ckpt_nc == model_nc:
+            return ckpt_params  # Already matched
+
+        log_stage(
+            f"[harmonize] num_classes mismatch: checkpoint={ckpt_nc} vs model={model_nc} "
+            f"at {ckpt_path}. Auto-adjusting..."
+        )
+
+        if ckpt_nc > model_nc:
+            # Crop
+            new_emb = ckpt_emb[:model_nc]
+        else:
+            # Pad with zeros
+            pad_shape = list(ckpt_emb.shape)
+            pad_shape[0] = model_nc - ckpt_nc
+            pad = jnp.zeros(pad_shape, dtype=ckpt_emb.dtype)
+            new_emb = jnp.concatenate([ckpt_emb, pad], axis=0)
+
+        # Walk down and replace
+        def _set_nested(d, keys, val):
+            if len(keys) == 1:
+                d[keys[0]] = val
+                return
+            _set_nested(d[keys[0]], keys[1:], val)
+
+        # ckpt_path is like /LabelEmbedder_0/Embed_0/embedding
+        path_parts = [p for p in ckpt_path.split("/") if p]
+        _set_nested(ckpt_params, path_parts, new_emb)
+        log_stage(f"[harmonize] Adjusted embedding: {ckpt_nc} → {model_nc}")
+        return ckpt_params
+
+    # ── GCS mount path for checkpoints (read directly, no download) ───────
+    GCS_MOUNT_CKPT = "/home/minhhieuntt0805/gcs_data/Layersync-ckpt-jax/Layersync-ckpt-jax"
+
+    # ── Model, state, EMA — init on CPU to avoid TPU OOM ─────────────────
+    rng = jax.random.PRNGKey(42)
+    cpu_device = jax.devices("cpu")[0]
+    log_stage("Initializing model on CPU to avoid TPU OOM...")
+    with jax.default_device(cpu_device):
+        state, ema_params = create_train_state(rng, config, args.learning_rate, args.grad_clip)
+
+    # ── Resume from checkpoint if requested ───────────────────────────────
     resumed_step = 0
     if args.resume:
         import flax.serialization
 
-        # Build template for the full training checkpoint dict
-        train_ckpt_template = {
-            'params': state.params,
-            'opt_state': state.opt_state,
-            'step': 0,
-        }
+        model_param_keys = set(state.params.keys())
+        log_stage(f"Model param top-level keys: {sorted(model_param_keys)[:5]}...")
 
-        restored_ckpt = None
-        # 1. Try msgpack first (most reliable on Kaggle)
-        msgpack_files = sorted(glob.glob(os.path.join(args.ckpt_dir, "checkpoint_*.msgpack")))
-        if msgpack_files:
-            latest = msgpack_files[-1]
-            log_stage(f"Resuming from msgpack: {os.path.basename(latest)}")
-            with open(latest, "rb") as f:
-                restored_ckpt = flax.serialization.from_bytes(train_ckpt_template, f.read())
-            resumed_step = int(restored_ckpt['step'])
-        # 2. Try orbax/flax checkpoints
-        elif checkpoints is not None:
-            try:
-                restored_ckpt = checkpoints.restore_checkpoint(args.ckpt_dir, train_ckpt_template)
-                if restored_ckpt is not train_ckpt_template:
-                    resumed_step = int(restored_ckpt['step'])
-                else:
-                    restored_ckpt = None
-            except Exception as e:
-                log_stage(f"flax.checkpoints restore failed: {e}")
+        def _ckpt_step_key(path):
+            """Extract numeric step from checkpoint filename for sorting."""
+            import re
+            m = re.search(r'checkpoint_(\d+)', os.path.basename(path))
+            return int(m.group(1)) if m else 0
 
-        if restored_ckpt is not None:
-            state = state.replace(
-                params=restored_ckpt['params'],
-                opt_state=restored_ckpt['opt_state'],
-                step=resumed_step,
+        def _find_ckpt_files(search_dir):
+            """Find checkpoint files in a directory, return (msgpack_files, raw_files) sorted by step."""
+            msgpack_files = sorted(
+                glob.glob(os.path.join(search_dir, "checkpoint_*.msgpack")),
+                key=_ckpt_step_key,
             )
-            log_stage(f"Resumed train_state (params + optimizer) at step {resumed_step}")
+            raw_files = sorted(
+                (f for f in glob.glob(os.path.join(search_dir, "checkpoint_*"))
+                 if not f.endswith(".msgpack") and os.path.isfile(f)),
+                key=_ckpt_step_key,
+            )
+            return msgpack_files, raw_files
 
-        # Restore EMA params
-        ema_dir = os.path.join(args.ckpt_dir, "ema")
-        ema_msgpack = sorted(glob.glob(os.path.join(ema_dir, "checkpoint_*.msgpack")))
-        if ema_msgpack:
-            with open(ema_msgpack[-1], "rb") as f:
-                ema_params = flax.serialization.from_bytes(ema_params, f.read())
-            log_stage(f"Resumed EMA params from {ema_dir}")
-        elif checkpoints is not None:
-            try:
-                restored_ema = checkpoints.restore_checkpoint(ema_dir, ema_params)
-                if restored_ema is not ema_params:
-                    ema_params = restored_ema
-                    log_stage(f"Resumed EMA params from {ema_dir}")
-            except Exception:
-                pass
+        def _load_raw_no_template(filepath):
+            """Load a msgpack checkpoint WITHOUT a template (raw dict)."""
+            log_stage(f"Loading raw checkpoint: {filepath} ({os.path.getsize(filepath)} bytes)...")
+            with open(filepath, "rb") as f:
+                data = flax.serialization.from_bytes(None, f.read())
+            log_stage(f"Raw checkpoint loaded. Type={type(data).__name__}")
+            return data
+
+        # ── Resolve checkpoint directory ──────────────────────────────────
+        # Priority: local ckpt_dir → GCS mount
+        ckpt_dir = args.ckpt_dir
+        ema_dir = os.path.join(ckpt_dir, "ema")
+        local_msgpack, local_raw = _find_ckpt_files(ckpt_dir)
+        local_orbax_dirs = sorted(
+            (d for d in glob.glob(os.path.join(ckpt_dir, "checkpoint_*"))
+             if os.path.isdir(d)),
+            key=_ckpt_step_key,
+        )
+
+        if not local_msgpack and not local_raw and not local_orbax_dirs:
+            # Fallback: read directly from GCS mount
+            if os.path.isdir(GCS_MOUNT_CKPT):
+                log_stage(f"No local checkpoints. Reading from GCS mount: {GCS_MOUNT_CKPT}")
+                ckpt_dir = GCS_MOUNT_CKPT
+                ema_dir = os.path.join(GCS_MOUNT_CKPT, "ema")
+            else:
+                log_stage(f"GCS mount not available at {GCS_MOUNT_CKPT}")
+
+        # ── Load main checkpoint (params + opt_state + step) ──────────────
+        with jax.default_device(cpu_device):
+            restored_ckpt = None
+            msgpack_files, raw_files = _find_ckpt_files(ckpt_dir)
+
+            # 1. Try msgpack first
+            if msgpack_files:
+                latest = msgpack_files[-1]
+                log_stage(f"Resuming from msgpack: {os.path.basename(latest)}")
+                try:
+                    with open(latest, "rb") as f:
+                        restored_ckpt = flax.serialization.from_bytes(
+                            {'params': state.params, 'opt_state': state.opt_state, 'step': 0},
+                            f.read(),
+                        )
+                    resumed_step = int(restored_ckpt['step'])
+                except Exception as e:
+                    log_stage(f"Msgpack template restore failed: {e}")
+                    # Try raw load + align
+                    try:
+                        restored_ckpt = _load_raw_no_template(latest)
+                        if isinstance(restored_ckpt, dict) and 'params' in restored_ckpt:
+                            restored_ckpt['params'] = _align_keys(restored_ckpt['params'], state.params)
+                            restored_ckpt['params'] = _harmonize_num_classes(restored_ckpt['params'], state.params)
+                            resumed_step = int(restored_ckpt.get('step', 0))
+                    except Exception as e2:
+                        log_stage(f"Msgpack raw restore also failed: {e2}")
+
+            # 2. Try raw files (flax.training.checkpoints format without .msgpack ext)
+            if restored_ckpt is None and raw_files:
+                latest_raw = raw_files[-1]
+                log_stage(f"Trying raw checkpoint: {os.path.basename(latest_raw)}")
+                try:
+                    raw_data = _load_raw_no_template(latest_raw)
+                    if isinstance(raw_data, dict):
+                        if 'params' in raw_data:
+                            raw_data['params'] = _align_keys(raw_data['params'], state.params)
+                            raw_data['params'] = _harmonize_num_classes(raw_data['params'], state.params)
+                            resumed_step = int(raw_data.get('step', 0))
+                            restored_ckpt = raw_data
+                            log_stage(f"Raw checkpoint loaded at step {resumed_step}")
+                        else:
+                            log_stage(f"Raw checkpoint has no 'params' key. Keys: {list(raw_data.keys())[:10]}")
+                except Exception as e:
+                    log_stage(f"Raw checkpoint load failed: {e}")
+
+            # 3. Try native Orbax PyTreeCheckpointer
+            if restored_ckpt is None:
+                try:
+                    import orbax.checkpoint as ocp
+                    orbax_ckpt_dirs = sorted(
+                        d for d in glob.glob(os.path.join(ckpt_dir, "checkpoint_*"))
+                        if os.path.isdir(d)
+                    )
+                    if orbax_ckpt_dirs:
+                        latest_orbax = orbax_ckpt_dirs[-1]
+                        log_stage(f"Trying Orbax native restore: {latest_orbax}")
+                        checkpointer = ocp.PyTreeCheckpointer()
+                        raw_data = checkpointer.restore(latest_orbax)
+                        # Orbax restores arrays onto the original device (TPU_0)
+                        # per the saved _sharding metadata.  Move everything to
+                        # CPU immediately so replicate_tree() later won't cause
+                        # TPU_0 to hold TWO copies (original + replicated).
+                        cpu_device = jax.devices('cpu')[0]
+                        raw_data = jax.tree_util.tree_map(
+                            lambda x: jax.device_put(x, cpu_device) if hasattr(x, 'shape') else x,
+                            raw_data,
+                        )
+                        log_stage("Orbax checkpoint moved to CPU.")
+                        if isinstance(raw_data, dict) and 'params' in raw_data:
+                            raw_data['params'] = _align_keys(raw_data['params'], state.params)
+                            raw_data['params'] = _harmonize_num_classes(raw_data['params'], state.params)
+                            resumed_step = int(raw_data.get('step', 0))
+                            restored_ckpt = raw_data
+                            log_stage(f"Orbax checkpoint loaded at step {resumed_step}")
+                except Exception as e:
+                    log_stage(f"Orbax native restore failed: {e}")
+
+            # ── Apply restored checkpoint to state ────────────────────────
+            if restored_ckpt is not None and isinstance(restored_ckpt, dict):
+                restored_params = restored_ckpt.get('params', None)
+                restored_opt = restored_ckpt.get('opt_state', None)
+
+                if restored_params is not None:
+                    # Convert all arrays to jnp on CPU
+                    restored_params = jax.tree_util.tree_map(jnp.asarray, restored_params)
+
+                    # Validate opt_state structure: raw-loaded opt_state is often
+                    # a plain dict that doesn't match optax's internal NamedTuple
+                    # structure, causing "number of updates and states has to be
+                    # the same in chain" errors. Only use it if tree structure matches exactly.
+                    opt_state_valid = False
+                    if restored_opt is not None:
+                        try:
+                            restored_opt = jax.tree_util.tree_map(jnp.asarray, restored_opt)
+                            struct_restored = jax.tree_util.tree_structure(restored_opt)
+                            struct_expected = jax.tree_util.tree_structure(state.opt_state)
+                            if struct_restored == struct_expected:
+                                opt_state_valid = True
+                                log_stage("opt_state tree structure matches exactly, restoring optimizer")
+                            else:
+                                log_stage(
+                                    "[WARN] opt_state tree structure mismatch (dict vs NamedTuple or key mismatch). "
+                                    "Discarding opt_state, optimizer will reset."
+                                )
+                        except Exception as e:
+                            log_stage(f"[WARN] opt_state validation failed: {e}. Discarding.")
+
+                    if opt_state_valid:
+                        state = state.replace(
+                            params=restored_params,
+                            opt_state=restored_opt,
+                            step=resumed_step,
+                        )
+                        log_stage(f"Resumed train_state (params + optimizer) at step {resumed_step}")
+                    else:
+                        # Only params — reset optimizer
+                        state = state.replace(
+                            params=restored_params,
+                            step=resumed_step,
+                        )
+                        log_stage(f"Resumed params-only at step {resumed_step} (optimizer state reset)")
+
+            # ── Restore EMA params ────────────────────────────────────────
+            ema_restored = False
+            ema_msgpack, ema_raw = _find_ckpt_files(ema_dir)
+
+            # 1. Try msgpack EMA
+            if ema_msgpack and not ema_restored:
+                latest_ema = ema_msgpack[-1]
+                log_stage(f"Loading EMA from msgpack: {os.path.basename(latest_ema)}")
+                try:
+                    with open(latest_ema, "rb") as f:
+                        ema_params = flax.serialization.from_bytes(ema_params, f.read())
+                    ema_restored = True
+                    log_stage(f"Resumed EMA params from msgpack")
+                except Exception as e:
+                    log_stage(f"EMA msgpack template restore failed: {e}")
+                    # Try raw load + align
+                    try:
+                        raw_ema = _load_raw_no_template(latest_ema)
+                        raw_ema = _align_keys(raw_ema, state.params)
+                        raw_ema = _harmonize_num_classes(raw_ema, state.params)
+                        ema_params = jax.tree_util.tree_map(jnp.asarray, raw_ema)
+                        ema_restored = True
+                        log_stage(f"Resumed EMA from msgpack (raw + key-aligned)")
+                    except Exception as e2:
+                        log_stage(f"EMA msgpack raw restore also failed: {e2}")
+
+            # 2. Try raw EMA files
+            if ema_raw and not ema_restored:
+                latest_ema_raw = ema_raw[-1]
+                log_stage(f"Loading EMA from raw file: {os.path.basename(latest_ema_raw)}")
+                try:
+                    raw_ema = _load_raw_no_template(latest_ema_raw)
+                    raw_ema = _align_keys(raw_ema, state.params)
+                    raw_ema = _harmonize_num_classes(raw_ema, state.params)
+                    ema_params = jax.tree_util.tree_map(jnp.asarray, raw_ema)
+                    ema_restored = True
+                    log_stage(f"Resumed EMA from raw file (key-aligned)")
+                except Exception as e:
+                    log_stage(f"Raw EMA load failed: {e}")
+
+            # 3. Try Orbax native EMA
+            if not ema_restored:
+                try:
+                    import orbax.checkpoint as ocp
+                    orbax_ema_dirs = sorted(
+                        d for d in glob.glob(os.path.join(ema_dir, "checkpoint_*"))
+                        if os.path.isdir(d)
+                    )
+                    if orbax_ema_dirs:
+                        latest_orbax_ema = orbax_ema_dirs[-1]
+                        log_stage(f"Trying Orbax native EMA restore: {latest_orbax_ema}")
+                        checkpointer = ocp.PyTreeCheckpointer()
+                        raw_ema = checkpointer.restore(latest_orbax_ema)
+                        # Move to CPU (same reason as main checkpoint)
+                        cpu_device = jax.devices('cpu')[0]
+                        raw_ema = jax.tree_util.tree_map(
+                            lambda x: jax.device_put(x, cpu_device) if hasattr(x, 'shape') else x,
+                            raw_ema,
+                        )
+                        raw_ema = _align_keys(raw_ema, state.params)
+                        raw_ema = _harmonize_num_classes(raw_ema, state.params)
+                        ema_params = jax.tree_util.tree_map(jnp.asarray, raw_ema)
+                        ema_restored = True
+                        log_stage(f"Resumed EMA from Orbax native")
+                except Exception as e:
+                    log_stage(f"Orbax EMA restore failed: {e}")
+
+            # 4. If EMA still not restored, copy from main params
+            if not ema_restored and restored_ckpt is not None:
+                log_stage("[WARN] EMA not restored — copying from main params as fallback")
+                ema_params = jax.tree_util.tree_map(lambda x: x, state.params)
 
         if resumed_step == 0:
             log_stage("No checkpoint found, starting fresh.")
+
+    # Free checkpoint data from CPU memory before replicating to TPU.
+    # The restored_ckpt dict holds params+opt_state (~7GB) that are no longer
+    # needed after state.replace().  Without this, they stay alive in the
+    # local scope and compete for memory during replicate_tree.
+    import gc
+    try: del restored_ckpt
+    except NameError: pass
+    try: del restored_params
+    except NameError: pass
+    try: del restored_opt
+    except NameError: pass
+    try: del raw_ema
+    except NameError: pass
+    try: del raw_ckpt
+    except NameError: pass
+    gc.collect()
+    log_stage("Freed checkpoint temporaries before replication.")
 
     state = replicate_tree(state)
     ema_params = replicate_tree(ema_params)
@@ -1689,13 +2012,11 @@ def main():
 
     def _ensure_vae_backend():
         if _flax_decode_cache[0] is None:
-            decode_fn, params_repl = _build_flax_vae_decode_fn(args.vae_model, num_devices, args.vae_hf_config)
-            if decode_fn is not None:
-                _flax_decode_cache[0] = (decode_fn, params_repl)
-            else:
-                log_stage(f"Spawning VAE decode worker (CPU subprocess): {args.vae_model!r} …")
-                _flax_decode_cache[0] = VAEDecodeSubprocess(args.vae_model, args.vae_hf_config)
-                log_stage("VAE decode worker ready.")
+            # Always use CPU subprocess to avoid permanent TPU HBM usage.
+            # Flax TPU decode was causing OOM when combined with DiT-XL + optimizer + EMA.
+            log_stage(f"Spawning VAE decode worker (CPU subprocess): {args.vae_model!r} …")
+            _flax_decode_cache[0] = VAEDecodeSubprocess(args.vae_model, args.vae_hf_config)
+            log_stage("VAE decode worker ready.")
         return _flax_decode_cache[0]
 
     def _decode_tpu(latents_nchw, decode_fn, params_repl):
@@ -1751,17 +2072,40 @@ def main():
             chunks.append(decode_latents(latents_nchw[start:start + chunk_size]))
         return np.concatenate(chunks, axis=0)
 
-    # ── InceptionV3 for FID/sFID: lazy-init, cached per mode ──────────────────
-    _inception_fns = {}  # mode -> apply_fn
+    # ── InceptionV3 for FID/sFID: lazy-init, CPU-cached params ─────────────────
+    _inception_cache = {}   # mode -> (apply_fn, params_cpu)
+    _inception_tpu = [None] # (params_replicated,) when loaded to TPU
 
     def get_inception(mode="pooled"):
+        """Return (apply_fn, params_cpu). Params stay on CPU; use load/unload for TPU."""
         from src.fid_utils import get_inception_network
         mode = str(mode)
-        if mode not in _inception_fns:
+        if mode not in _inception_cache:
             log_stage(f"Loading InceptionV3 ({mode})…")
-            _inception_fns[mode] = get_inception_network(mode=mode)
-            log_stage("InceptionV3 ready.")
-        return _inception_fns[mode]
+            _inception_cache[mode] = get_inception_network(mode=mode)
+            log_stage("InceptionV3 ready (params on CPU).")
+        return _inception_cache[mode]
+
+    def load_inception_to_tpu(mode="pooled"):
+        """Replicate Inception params to TPU. Returns inception_fn(imgs) callable."""
+        apply_fn, params_cpu = get_inception(mode)
+        log_stage("Replicating InceptionV3 params to TPU…")
+        params_repl = replicate_tree(params_cpu)
+        _inception_tpu[0] = params_repl
+        log_stage("InceptionV3 params on TPU.")
+        return functools.partial(apply_fn, params_repl)
+
+    def unload_inception_from_tpu():
+        """Delete Inception params from TPU to free HBM."""
+        if _inception_tpu[0] is not None:
+            _inception_tpu[0] = None
+            # Also clear the CPU cache so params aren't held in memory
+            _inception_cache.clear()
+            import gc; gc.collect()
+            # Force JAX to release TPU HBM
+            jax.clear_caches()
+            gc.collect()
+            log_stage("InceptionV3 params freed from TPU.")
 
     # ── Torchvision Inception-v3 worker for Inception Score (subprocess) ──────
     _is_worker = [None]
@@ -1905,49 +2249,52 @@ def main():
         )
         block_pytree(probe_metrics)
 
-        inception_fn = get_inception("pooled+spatial")
+        inception_fn = load_inception_to_tpu("pooled+spatial")
+        try:
+            log_stage(
+                f"[FID probe] decoding one real validation batch of {args.batch_size} latents "
+                f"with VAE micro-batch {args.vae_decode_batch_size}..."
+            )
+            probe_val_batch, val_data_iter = next_validation_batch(
+                val_data_iter, data_pattern=args.val_data_path, batch_size=args.batch_size
+            )
+            real_latents_nchw = unpatchify_patchified_latents(probe_val_batch[0])
+            real_images = decode_latents_batched(real_latents_nchw, args.vae_decode_batch_size)
+            extract_inception_features_host_images(
+                real_images,
+                inception_fn,
+                num_devices=num_devices,
+                local_batch=inception_local_batch,
+                mode="pooled+spatial",
+            )
 
-        log_stage(
-            f"[FID probe] decoding one real validation batch of {args.batch_size} latents "
-            f"with VAE micro-batch {args.vae_decode_batch_size}..."
-        )
-        probe_val_batch, val_data_iter = next_validation_batch(
-            val_data_iter, data_pattern=args.val_data_path, batch_size=args.batch_size
-        )
-        real_latents_nchw = unpatchify_patchified_latents(probe_val_batch[0])
-        real_images = decode_latents_batched(real_latents_nchw, args.vae_decode_batch_size)
-        extract_inception_features_host_images(
-            real_images,
-            inception_fn,
-            num_devices=num_devices,
-            local_batch=inception_local_batch,
-            mode="pooled+spatial",
-        )
+            fake_bs = min(args.fid_batch_size, args.num_fid_samples)
+            log_stage(
+                f"[FID probe] generating one fake batch of {fake_bs} latents "
+                f"({args.fid_num_steps} steps, cfg={args.fid_cfg_scale})..."
+            )
+            single_ema_params = jax.tree_util.tree_map(lambda w: w[0], ema_params)
+            probe_rng = jax.random.fold_in(rng[0], 0xF1D)
+            probe_classes = jax.random.randint(probe_rng, (fake_bs,), 0, 1000)
+            fake_latents = np.asarray(
+                jax.device_get(fid_sample_latents_jitted(single_ema_params, probe_classes, probe_rng)),
+                dtype=np.float32,
+            )
+            fake_images = decode_latents_batched(fake_latents, args.vae_decode_batch_size)
+            extract_inception_features_host_images(
+                fake_images,
+                inception_fn,
+                num_devices=num_devices,
+                local_batch=inception_local_batch,
+                mode="pooled+spatial",
+            )
 
-        fake_bs = min(args.fid_batch_size, args.num_fid_samples)
-        log_stage(
-            f"[FID probe] generating one fake batch of {fake_bs} latents "
-            f"({args.fid_num_steps} steps, cfg={args.fid_cfg_scale})..."
-        )
-        single_ema_params = jax.tree_util.tree_map(lambda w: w[0], ema_params)
-        probe_rng = jax.random.fold_in(rng[0], 0xF1D)
-        probe_classes = jax.random.randint(probe_rng, (fake_bs,), 0, 1000)
-        fake_latents = np.asarray(
-            jax.device_get(fid_sample_latents_jitted(single_ema_params, probe_classes, probe_rng)),
-            dtype=np.float32,
-        )
-        fake_images = decode_latents_batched(fake_latents, args.vae_decode_batch_size)
-        extract_inception_features_host_images(
-            fake_images,
-            inception_fn,
-            num_devices=num_devices,
-            local_batch=inception_local_batch,
-            mode="pooled+spatial",
-        )
-
-        log_stage(
-            "[FID probe] success: discarded train step + real/fake pooled+spatial metric batches completed without OOM."
-        )
+            log_stage(
+                "[FID probe] success: discarded train step + real/fake pooled+spatial metric batches completed without OOM."
+            )
+        finally:
+            del inception_fn
+            unload_inception_from_tpu()
         return val_data_iter, cached_train_batch
 
     _eval_real_cache = [None]  # dict with pooled/spatial stats and metadata
@@ -1965,7 +2312,7 @@ def main():
         need = int(args.num_fid_samples)
         current_val_iter = val_data_iter
 
-        inception_fn = get_inception("pooled+spatial")
+        inception_fn = load_inception_to_tpu("pooled+spatial")
 
         pr_enabled = bool(args.precision_recall)
         pr_full = bool(args.pr_full_mode)
@@ -2164,6 +2511,9 @@ def main():
         summary_parts.append(f"(n={need})")
         log_stage("  ".join(summary_parts))
         safe_wandb_log(metrics, step=step)
+        # Free InceptionV3 from TPU HBM after eval
+        del inception_fn
+        unload_inception_from_tpu()
         return current_val_iter
 
     def compute_block_corr(step, val_data_iter):
@@ -2198,7 +2548,7 @@ def main():
     # ── Preflight checks ──────────────────────────────────────────────────────
     prefetched_train_batch = None
     if args.preflight_checks:
-        inception_fn_for_preflight = get_inception("pooled+spatial") if args.preflight_fid_samples > 0 else None
+        inception_fn_for_preflight = load_inception_to_tpu("pooled+spatial") if args.preflight_fid_samples > 0 else None
         preflight_real_batch = None
         if val_iterator is not None:
             preflight_batch, val_iterator = next_validation_batch(
@@ -2231,6 +2581,10 @@ def main():
             linear_probe_runner=run_preflight_linear_probe if args.linear_probe else None,
             block_corr_runner=run_preflight_block_corr if args.block_corr_freq > 0 else None,
         )
+        # Free InceptionV3 from TPU after preflight
+        if inception_fn_for_preflight is not None:
+            del inception_fn_for_preflight
+            unload_inception_from_tpu()
 
         if args.preflight_fid_memory_probe:
             val_iterator, prefetched_train_batch = run_fid_memory_probe(val_iterator, prefetched_train_batch)
@@ -2268,6 +2622,13 @@ def main():
         log_stage(f"Checkpoint saved at step {step}")
 
     # ── Training loop ─────────────────────────────────────────────────────────
+    # Force-reclaim TPU HBM from preflight XLA caches (Inception pmap,
+    # sample_latents_jitted, etc.) before compiling the training step.
+    import gc
+    jax.clear_caches()
+    gc.collect()
+    log_stage("Cleared XLA caches before training loop.")
+
     global_step = resumed_step
     t0 = time.time()
 
