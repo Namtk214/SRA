@@ -1,23 +1,30 @@
 #!/usr/bin/env python3
 """
-Sample images from a trained Self-Flow diffusion model (JAX/Flax).
+Sample images from a trained Self-Flow / LayerSync model (JAX/Flax).
 
-Optimized for TPU v5p-8 (8 cores):
-  - jax.pmap across all TPU cores for 8x throughput
-  - bfloat16 for TPU-native compute
-  - Orbax checkpoint loading (TPU-trained checkpoints)
-  - Static CFG branching to avoid tracing errors
+Supports the current Orbax checkpoint bundle format:
+    ckpt_dir/
+      checkpoint_<step>/          ← main (params + opt_state + step)
+      ema/
+        checkpoint_<step>/        ← EMA params (flat dict)
 
-Usage (Kaggle TPU v5p-8):
-    python sample.py --ckpt path/to/ema/checkpoint_420000 \
-        --model-size B --num-fid-samples 50000 --batch-size 64
+Usage:
+    # From bundle dir (auto-finds latest EMA checkpoint):
+    python sample.py --ckpt-dir /path/to/layersync-L-v3 \
+        --model-size XL --num-fid-samples 50000 --batch-size 64
+
+    # Direct Orbax checkpoint path (backward compat):
+    python sample.py --ckpt /path/to/ema/checkpoint_1460000 \
+        --model-size XL --num-fid-samples 50000
 
 Output: NPZ file compatible with ADM evaluation suite.
 """
 
 import os
+import re
 import math
 import time
+import glob
 import argparse
 import functools
 from pathlib import Path
@@ -28,7 +35,6 @@ import jax.numpy as jnp
 from PIL import Image
 from tqdm import tqdm
 from einops import rearrange
-import collections.abc
 
 from src.model import SelfFlowDiT
 from src.sampling import denoise_loop
@@ -68,6 +74,190 @@ def create_npz_from_samples(samples, output_path):
     print(f"Saved {len(samples)} samples to {output_path}")
 
 
+# ── Checkpoint loading utilities ──────────────────────────────────────────────
+
+def _align_keys(d, reference_keys):
+    """Recursively rename checkpoint keys to match the model's param structure.
+
+    Flax nn.remat wraps DiTBlock → CheckpointDiTBlock. Checkpoints saved
+    with/without remat will have mismatched keys.
+    """
+    if not isinstance(d, dict):
+        return d
+    new_d = {}
+    for k, v in d.items():
+        new_key = k
+        if k.startswith("CheckpointDiTBlock_"):
+            plain_key = k.replace("CheckpointDiTBlock_", "DiTBlock_", 1)
+            if plain_key in reference_keys and k not in reference_keys:
+                new_key = plain_key
+        elif k.startswith("DiTBlock_"):
+            remat_key = k.replace("DiTBlock_", "CheckpointDiTBlock_", 1)
+            if remat_key in reference_keys and k not in reference_keys:
+                new_key = remat_key
+        child_ref = reference_keys
+        if isinstance(reference_keys, dict) and new_key in reference_keys:
+            child_val = reference_keys[new_key]
+            if isinstance(child_val, dict):
+                child_ref = child_val
+        new_d[new_key] = _align_keys(v, child_ref)
+    return new_d
+
+
+def _harmonize_num_classes(ckpt_params, model_params):
+    """Auto-detect and fix num_classes mismatch in LabelEmbedder embedding."""
+    def _find_label_embedding(p, path=""):
+        if not isinstance(p, dict):
+            return None, None
+        for k, v in p.items():
+            full = f"{path}/{k}"
+            if k == "LabelEmbedder_0":
+                embed = v.get("Embed_0", {}).get("embedding", None)
+                if embed is not None:
+                    return embed, full + "/Embed_0/embedding"
+            result, rpath = _find_label_embedding(v, full)
+            if result is not None:
+                return result, rpath
+        return None, None
+
+    ckpt_emb, ckpt_path = _find_label_embedding(ckpt_params)
+    model_emb, _ = _find_label_embedding(model_params)
+    if ckpt_emb is None or model_emb is None:
+        return ckpt_params
+    ckpt_nc, model_nc = ckpt_emb.shape[0], model_emb.shape[0]
+    if ckpt_nc == model_nc:
+        return ckpt_params
+
+    print(f"[harmonize] num_classes mismatch: ckpt={ckpt_nc} vs model={model_nc}. Adjusting...")
+    if ckpt_nc > model_nc:
+        new_emb = ckpt_emb[:model_nc]
+    else:
+        pad = jnp.zeros((model_nc - ckpt_nc, *ckpt_emb.shape[1:]), dtype=ckpt_emb.dtype)
+        new_emb = jnp.concatenate([ckpt_emb, pad], axis=0)
+
+    path_parts = [p for p in ckpt_path.split("/") if p]
+    def _set_nested(d, keys, val):
+        if len(keys) == 1:
+            d[keys[0]] = val
+            return
+        _set_nested(d[keys[0]], keys[1:], val)
+    _set_nested(ckpt_params, path_parts, new_emb)
+    return ckpt_params
+
+
+def _find_latest_orbax_dir(base_dir):
+    """Find the latest checkpoint_<step> directory in base_dir."""
+    dirs = sorted(
+        (d for d in glob.glob(os.path.join(base_dir, "checkpoint_*")) if os.path.isdir(d)),
+        key=lambda p: int(re.search(r'checkpoint_(\d+)', os.path.basename(p)).group(1))
+            if re.search(r'checkpoint_(\d+)', os.path.basename(p)) else 0,
+    )
+    return dirs[-1] if dirs else None
+
+
+def _load_orbax_checkpoint(ckpt_path):
+    """Load an Orbax PyTree checkpoint and move arrays to CPU."""
+    import orbax.checkpoint as ocp
+    print(f"Loading Orbax checkpoint: {ckpt_path}")
+    checkpointer = ocp.PyTreeCheckpointer()
+    raw = checkpointer.restore(ckpt_path)
+    cpu_device = jax.devices('cpu')[0]
+    raw = jax.tree_util.tree_map(
+        lambda x: jax.device_put(x, cpu_device) if hasattr(x, 'shape') else x,
+        raw,
+    )
+    return raw
+
+
+def resolve_ckpt_path(args):
+    """Resolve the EMA checkpoint path from --ckpt-dir or --ckpt.
+
+    Returns: (ema_ckpt_path, step)
+    """
+    # Direct path: --ckpt points to an Orbax checkpoint directory
+    if args.ckpt and os.path.isdir(args.ckpt):
+        m = re.search(r'checkpoint_(\d+)', os.path.basename(args.ckpt))
+        step = int(m.group(1)) if m else 0
+        return args.ckpt, step
+
+    # Bundle dir: --ckpt-dir points to the bundle root
+    ckpt_dir = getattr(args, 'ckpt_dir', None) or args.ckpt
+    if not ckpt_dir or not os.path.isdir(ckpt_dir):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_dir}")
+
+    # Try ema/ subdirectory first (preferred for sampling)
+    ema_dir = os.path.join(ckpt_dir, "ema")
+    if os.path.isdir(ema_dir):
+        latest = _find_latest_orbax_dir(ema_dir)
+        if latest:
+            m = re.search(r'checkpoint_(\d+)', os.path.basename(latest))
+            step = int(m.group(1)) if m else 0
+            print(f"Found EMA checkpoint: {latest} (step {step})")
+            return latest, step
+
+    # Fallback: main checkpoint (extract 'params' key)
+    latest = _find_latest_orbax_dir(ckpt_dir)
+    if latest:
+        m = re.search(r'checkpoint_(\d+)', os.path.basename(latest))
+        step = int(m.group(1)) if m else 0
+        print(f"Found main checkpoint: {latest} (step {step})")
+        return latest, step
+
+    raise FileNotFoundError(f"No checkpoint_* found in {ckpt_dir} or {ema_dir}")
+
+
+def load_model(ckpt_path, model_size="XL", cfg_dropout_rate=DEFAULT_CFG_DROPOUT_RATE, step=0):
+    """Load the DiT backbone from an Orbax checkpoint.
+
+    Handles:
+      - EMA checkpoint (flat params dict) or main checkpoint (params in 'params' key)
+      - DiTBlock_* ↔ CheckpointDiTBlock_* key remapping (nn.remat)
+      - num_classes mismatch auto-fix
+    """
+    config = _model_config_for_size(model_size, cfg_dropout_rate=cfg_dropout_rate)
+    model = SelfFlowDiT(**config, per_token=False)
+
+    # Initialize on CPU
+    cpu_device = jax.devices('cpu')[0]
+    with jax.default_device(cpu_device):
+        key = jax.random.PRNGKey(0)
+        patch_dim = config["in_channels"] * config["patch_size"] ** 2
+        n_patches = (config["input_size"] // config["patch_size"]) ** 2
+        dummy_x = jnp.ones((1, n_patches, patch_dim))
+        dummy_t = jnp.ones((1,))
+        dummy_vec = jnp.ones((1,), dtype=jnp.int32)
+        variables = model.init(key, dummy_x, timesteps=dummy_t, vector=dummy_vec, deterministic=True)
+        params = variables["params"]
+
+    if ckpt_path is not None and os.path.exists(ckpt_path):
+        raw = _load_orbax_checkpoint(ckpt_path)
+
+        # Determine if this is a main checkpoint (has 'params' key) or EMA (flat dict)
+        if isinstance(raw, dict) and 'params' in raw and 'opt_state' in raw:
+            print(f"Main checkpoint detected (step={raw.get('step', step)}). Extracting 'params'...")
+            ckpt_params = raw['params']
+        else:
+            print(f"EMA checkpoint detected (flat params dict).")
+            ckpt_params = raw
+
+        # Align keys and harmonize
+        ckpt_params = _align_keys(ckpt_params, params)
+        ckpt_params = _harmonize_num_classes(ckpt_params, params)
+        ckpt_params = jax.tree_util.tree_map(jnp.asarray, ckpt_params)
+
+        # Merge into model params
+        for k in list(params.keys()):
+            if k in ckpt_params:
+                params[k] = ckpt_params[k]
+
+        total = sum(v.size for v in jax.tree_util.tree_leaves(params))
+        print(f"Loaded {total:,} parameters")
+    else:
+        print(f"WARNING: No checkpoint loaded — using random init!")
+
+    return model, params
+
+
 def load_vae(vae_model="stabilityai/sd-vae-ft-mse", dtype=jnp.bfloat16):
     """Load the SD-VAE for decoding latents to images."""
     from diffusers.models import FlaxAutoencoderKL
@@ -82,73 +272,8 @@ def load_vae(vae_model="stabilityai/sd-vae-ft-mse", dtype=jnp.bfloat16):
     return vae, vae_params, scale_factor, shift_factor
 
 
-def load_model(ckpt_path=None, model_size="B", cfg_dropout_rate=DEFAULT_CFG_DROPOUT_RATE):
-    """Load the DiT backbone from an Orbax checkpoint (TPU-trained).
-
-    Handles:
-      - TPU sharding → single/multi-device re-sharding
-      - DiTBlock_* ↔ CheckpointDiTBlock_* key remapping (nn.remat)
-      - Skipping feature_head / SimpleHead (not needed for sampling)
-    """
-    config = _model_config_for_size(model_size, cfg_dropout_rate=cfg_dropout_rate)
-    model = SelfFlowDiT(**config, per_token=False)
-
-    # Initialize parameters with random key
-    key = jax.random.PRNGKey(0)
-    patch_dim = config["in_channels"] * config["patch_size"] ** 2
-    n_patches = (config["input_size"] // config["patch_size"]) ** 2
-    dummy_x = jnp.ones((1, n_patches, patch_dim))
-    dummy_t = jnp.ones((1,))
-    dummy_vec = jnp.ones((1,), dtype=jnp.int32)
-
-    variables = model.init(key, dummy_x, timesteps=dummy_t, vector=dummy_vec, deterministic=True)
-    params = variables["params"]
-
-    if ckpt_path is not None and os.path.exists(ckpt_path):
-        print(f"Loading checkpoint from {ckpt_path}")
-
-        import orbax.checkpoint as ocp
-
-        # Build target tree: remap CheckpointDiTBlock → DiTBlock for ckpt
-        ckpt_target = {}
-        for k, v in params.items():
-            if k in ('SimpleHead_0', 'feature_head'):
-                continue
-            ck = k.replace('CheckpointDiTBlock_', 'DiTBlock_') if k.startswith('CheckpointDiTBlock_') else k
-            ckpt_target[ck] = v
-
-        # Use first device for restore, replicate later
-        sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
-        restore_args = jax.tree_util.tree_map(
-            lambda x: ocp.ArrayRestoreArgs(
-                sharding=sharding, global_shape=x.shape, dtype=x.dtype),
-            ckpt_target)
-
-        restored = ocp.PyTreeCheckpointer().restore(
-            ckpt_path, item=ckpt_target, restore_args=restore_args)
-
-        # Remap DiTBlock → CheckpointDiTBlock and merge back
-        target_keys = set(params.keys())
-        for k, val in restored.items():
-            new_key = k
-            if k.startswith('DiTBlock_') and k not in target_keys:
-                new_key = k.replace('DiTBlock_', 'CheckpointDiTBlock_')
-            if new_key in target_keys:
-                params[new_key] = val
-
-        total = sum(v.size for v in jax.tree_util.tree_leaves(params))
-        print(f"Loaded {total:,} parameters")
-
-    return model, params
-
-
 def build_sample_step_pmap(model, vae, scale_factor, shift_factor, use_cfg=False):
-    """Build pmap-compiled sampling function for multi-device TPU.
-
-    Args:
-        use_cfg: Static bool — whether to use classifier-free guidance.
-                 Must be set at build time to avoid tracer errors.
-    """
+    """Build pmap-compiled sampling function for multi-device TPU."""
 
     @functools.partial(jax.pmap, static_broadcasted_argnums=(4, 5),
                        axis_name="devices")
@@ -200,7 +325,6 @@ def build_sample_step_pmap(model, vae, scale_factor, shift_factor, use_cfg=False
             )
 
         rng, denoise_rng = jax.random.split(rng)
-        # cfg_scale: pass None when no CFG to avoid tracer bool error in denoise_loop
         effective_cfg = cfg_scale if use_cfg else None
         samples = denoise_loop(
             model_fn=model_fn,
@@ -249,8 +373,12 @@ def replicate(tree, num_devices):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Sample images from SiT model (JAX) — TPU v5p-8 optimized")
-    parser.add_argument("--ckpt", type=str, default=None, help="Path to model checkpoint")
+        description="Sample images from SiT/LayerSync model (JAX) — TPU optimized")
+    parser.add_argument("--ckpt", type=str, default=None,
+                        help="Path to a specific Orbax checkpoint dir (e.g. ema/checkpoint_1460000)")
+    parser.add_argument("--ckpt-dir", type=str, default=None,
+                        help="Path to checkpoint bundle dir (auto-finds latest EMA). "
+                             "Priority: --ckpt > --ckpt-dir")
     parser.add_argument("--output-dir", type=str, default="./samples", help="Output directory")
     parser.add_argument("--num-fid-samples", type=int, default=50000,
                         help="Number of samples to generate")
@@ -261,7 +389,7 @@ def main():
     parser.add_argument("--seed", type=int, default=31, help="Random seed")
     parser.add_argument("--save-images", action="store_true", default=False,
                         help="Save individual PNG images (slow, disabled by default)")
-    parser.add_argument("--model-size", type=str, default="B",
+    parser.add_argument("--model-size", type=str, default="XL",
                         choices=["S", "B", "L", "XL"], help="DiT backbone size")
     parser.add_argument("--vae-model", type=str, default="stabilityai/sd-vae-ft-mse",
                         choices=["stabilityai/sd-vae-ft-mse", "stabilityai/sd-vae-ft-ema"],
@@ -278,15 +406,22 @@ def main():
                         help="Path to reference NPZ for automatic FID evaluation")
     args = parser.parse_args()
 
+    if args.ckpt is None and args.ckpt_dir is None:
+        parser.error("Specify --ckpt or --ckpt-dir")
+
     if not 0.0 <= args.cfg_dropout_rate < 1.0:
         raise ValueError("--cfg-dropout-rate must be in [0.0, 1.0)")
     if args.cfg_dropout_rate <= 0.0 and args.cfg_scale > 1.0:
         raise ValueError("--cfg-scale > 1 requires --cfg-dropout-rate > 0")
 
+    # ── Resolve checkpoint ────────────────────────────────────────────────
+    ckpt_path, step = resolve_ckpt_path(args)
+    print(f"Checkpoint: {ckpt_path} (step {step})")
+
     # ── Device setup ─────────────────────────────────────────────────────
     num_devices = jax.device_count()
     local_devices = jax.local_devices()
-    print(f"=== SiT-{args.model_size} Sampler (TPU-optimized pmap) ===")
+    print(f"\n=== SiT-{args.model_size} Sampler (TPU-optimized pmap) ===")
     print(f"Devices: {num_devices}x {local_devices[0].platform.upper()}")
     print(f"Batch: {args.batch_size}/device × {num_devices} devices "
           f"= {args.batch_size * num_devices} total/iter")
@@ -295,8 +430,9 @@ def main():
 
     # ── Load model & VAE ─────────────────────────────────────────────────
     model, params = load_model(
-        args.ckpt, model_size=args.model_size,
-        cfg_dropout_rate=args.cfg_dropout_rate)
+        ckpt_path, model_size=args.model_size,
+        cfg_dropout_rate=args.cfg_dropout_rate,
+        step=step)
     vae, vae_params, scale_factor, shift_factor = load_vae(
         vae_model=args.vae_model)
 
@@ -321,12 +457,10 @@ def main():
 
     rng = jax.random.PRNGKey(args.seed)
     rng, warmup_rng = jax.random.split(rng)
-    # Per-device RNGs
     warmup_rngs = jax.random.split(warmup_rng, num_devices)
     warmup_labels = jax.random.randint(
         jax.random.PRNGKey(0), (num_devices, bs_per_device), 0, 1000)
 
-    # Broadcast scalar args to per-device
     cfg_arr = jnp.full((num_devices,), args.cfg_scale)
     glow_arr = jnp.full((num_devices,), args.guidance_low)
     ghigh_arr = jnp.full((num_devices,), args.guidance_high)
@@ -350,7 +484,7 @@ def main():
     generated = 0
 
     # Use warmup batch as first batch
-    first_images = np.asarray(warmup_images)  # (num_devices, bs, 256, 256, 3)
+    first_images = np.asarray(warmup_images)
     first_images = first_images.reshape(-1, 256, 256, 3)
     needed = min(total_per_iter, total_samples)
     all_samples.append(first_images[:needed])
@@ -364,7 +498,6 @@ def main():
         needed = min(total_per_iter, total_samples - generated)
 
         rng, class_rng, step_rng = jax.random.split(rng, 3)
-        # Per-device RNGs and labels
         step_rngs = jax.random.split(step_rng, num_devices)
         class_labels = jax.random.randint(
             class_rng, (num_devices, bs_per_device), 0, 1000)
@@ -392,7 +525,10 @@ def main():
         print(f"Speed: {elapsed/(generated - total_per_iter):.4f} s/img (post-compile)")
 
     all_samples = np.concatenate(all_samples, axis=0)[:total_samples]
-    npz_path = output_dir / f"samples_{total_samples}.npz"
+
+    # Output filename includes step number for traceability
+    npz_name = f"samples_{total_samples}_step{step}.npz" if step > 0 else f"samples_{total_samples}.npz"
+    npz_path = output_dir / npz_name
     create_npz_from_samples(all_samples, npz_path)
     print(f"Shape: {all_samples.shape}, dtype: {all_samples.dtype}")
 
@@ -418,7 +554,6 @@ def main():
             result = subprocess.run(
                 ["python3", evaluator_path, args.ref_batch, str(npz_path)],
                 capture_output=True, text=True)
-            # Print only metric lines
             for line in (result.stdout + result.stderr).split('\n'):
                 if any(k in line for k in
                        ['FID', 'sFID', 'Inception Score', 'Precision', 'Recall']):
