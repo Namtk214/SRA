@@ -1,0 +1,12 @@
+WARNING:absl:The transformations API will eventually be replaced by an upgraded design. The current API will not be removed until this point, but it will no longer be actively worked on.
+[train.py] Resumed train_state (params + optimizer) at step 1325000
+[train.py] Restoring EMA from orbax: /home/nam_ngothanh05/checkpoints/sit-xl/ema/checkpoint_1325000
+/home/nam_ngothanh05/.local/lib/python3.10/site-packages/orbax/checkpoint/_src/serialization/jax_array_handlers.py:736: UserWarning: Sharding info not provided when restoring. Populating sharding info from sharding file. Please note restoration time will be slightly increased due to reading from file. Note also that this option is unsafe when restoring on a different topology than the checkpoint was saved with.
+  warnings.warn(
+[train.py] Resumed EMA params from /home/nam_ngothanh05/checkpoints/sit-xl/ema/checkpoint_1325000
+[train.py] Main params embedding shape: (1002, 1152), config num_classes=1001
+[train.py] Auto-detected num_classes=1002 from restored params (config had 1001). Updating config.
+[train.py] EMA embedding shape: (1002, 1152), expected num_classes=1002
+[train.py] EMA embedding shape matches config. No truncation needed.
+[train.py] Moving model state from CPU to TPU devices...
+[train.py] TPU replicate done.

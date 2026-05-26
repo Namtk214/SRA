@@ -479,9 +479,11 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
     )
 
     # AdamW with gradient clipping (paper specifies max_norm=1; paper-faithful)
+    # Use mixed precision: optimizer states (mu, nu) stored in bfloat16
+    # to reduce TPU HBM usage by ~40% (critical for XL model).
     tx = optax.chain(
         optax.clip_by_global_norm(grad_clip),
-        optax.adamw(learning_rate, weight_decay=0),
+        optax.adamw(learning_rate, weight_decay=0, mu_dtype=jnp.bfloat16),
     )
 
     state = train_state.TrainState.create(
@@ -654,7 +656,12 @@ def get_arrayrecord_dataloader(data_pattern, batch_size, is_training=True, seed=
         def map(self, record_bytes):
             parsed = pickle.loads(record_bytes)
 
-            latent = parsed["latent"] # numpy array shape: (4, 32, 32)
+            if "latent" in parsed:
+                latent = parsed["latent"]     # (4, 32, 32)
+            elif "moments" in parsed:
+                latent = parsed["moments"][:4]  # Use raw mean from (8, 32, 32)
+            else:
+                raise KeyError(f"Expected 'latent' or 'moments' key in record, got: {list(parsed.keys())}")
             label = parsed["label"]
 
             # Patchify the latent to DiT input (256, 16)
@@ -1114,6 +1121,9 @@ def main():
                         help="Number of recent checkpoints to keep. Older ones are deleted.")
     parser.add_argument("--resume", action="store_true",
                         help="Resume training from latest checkpoint in --ckpt-dir.")
+    parser.add_argument("--resume-ckpt", type=str, default=None,
+                        help="Path to an external orbax checkpoint directory to resume from "
+                             "(e.g. from HuggingFace). Overrides --ckpt-dir for initial restore only.")
     parser.add_argument("--data-path", type=str, required=True, help="Path/glob to training ArrayRecord files")
     parser.add_argument("--val-data-path", type=str, default=None)
     parser.add_argument("--wandb-project", type=str, default="sit-vanilla-jax")
@@ -1326,15 +1336,21 @@ def main():
         wandb.define_metric("*", step_metric="train/step")
     logger = AsyncWandbLogger(enabled=not args.no_wandb)
 
-    # ── Model, state, EMA ─────────────────────────────────────────────────────
-    rng = jax.random.PRNGKey(42)
-    state, ema_params = create_train_state(rng, config, args.learning_rate, args.grad_clip)
+    # ── Model, state, EMA (init on CPU to avoid TPU OOM during resume) ────────
+    cpu_device = jax.devices("cpu")[0]
+    with jax.default_device(cpu_device):
+        rng = jax.random.PRNGKey(42)
+        state, ema_params = create_train_state(rng, config, args.learning_rate, args.grad_clip)
 
     # ── Resume from checkpoint ────────────────────────────────────────────────
     resumed_step = 0
     if args.resume:
         import re as _re
         import flax.serialization
+
+        # Determine the directory to search for checkpoints
+        resume_dir = args.resume_ckpt if args.resume_ckpt else args.ckpt_dir
+        resume_dir = os.path.abspath(resume_dir)
 
         # Build template for the full training checkpoint dict
         train_ckpt_template = {
@@ -1345,7 +1361,7 @@ def main():
 
         restored_ckpt = None
         # 1. Try msgpack first (most reliable on Kaggle)
-        msgpack_files = sorted(glob.glob(os.path.join(args.ckpt_dir, "checkpoint_*.msgpack")))
+        msgpack_files = sorted(glob.glob(os.path.join(resume_dir, "checkpoint_*.msgpack")))
         if msgpack_files:
             latest = msgpack_files[-1]
             log_stage(f"Resuming from msgpack: {os.path.basename(latest)}")
@@ -1355,7 +1371,7 @@ def main():
         # 2. Try orbax/flax checkpoints
         elif checkpoints is not None:
             try:
-                restored_ckpt = checkpoints.restore_checkpoint(args.ckpt_dir, train_ckpt_template)
+                restored_ckpt = checkpoints.restore_checkpoint(resume_dir, train_ckpt_template)
                 if restored_ckpt is not train_ckpt_template:
                     resumed_step = int(restored_ckpt['step'])
                 else:
@@ -1363,37 +1379,136 @@ def main():
             except Exception as e:
                 log_stage(f"flax.checkpoints restore failed: {e}")
 
+        # 3. Try direct orbax restore (standalone orbax checkpoint directory)
+        if restored_ckpt is None and os.path.isfile(os.path.join(resume_dir, "_METADATA")):
+            log_stage(f"Detected standalone orbax checkpoint at {resume_dir}")
+            try:
+                import orbax.checkpoint as ocp
+                checkpointer = ocp.PyTreeCheckpointer()
+                restored_ckpt = checkpointer.restore(resume_dir, item=train_ckpt_template)
+                resumed_step = int(restored_ckpt['step'])
+                log_stage(f"Orbax restore successful, step={resumed_step}")
+            except Exception as e:
+                log_stage(f"Orbax direct restore failed: {e}")
+
         if restored_ckpt is not None:
+            # Cast optimizer states to bfloat16 to match mu_dtype=bfloat16 config
+            restored_opt_state = jax.tree_util.tree_map(
+                lambda x: x.astype(jnp.bfloat16) if hasattr(x, 'dtype') and x.dtype == jnp.float32 else x,
+                restored_ckpt['opt_state'],
+            )
             state = state.replace(
                 params=restored_ckpt['params'],
-                opt_state=restored_ckpt['opt_state'],
+                opt_state=restored_opt_state,
                 step=resumed_step,
             )
             log_stage(f"Resumed train_state (params + optimizer) at step {resumed_step}")
 
         # Restore EMA params
-        ema_dir = os.path.join(args.ckpt_dir, "ema")
-        ema_msgpack = sorted(glob.glob(os.path.join(ema_dir, "checkpoint_*.msgpack")))
-        if ema_msgpack:
-            with open(ema_msgpack[-1], "rb") as f:
-                ema_params = flax.serialization.from_bytes(ema_params, f.read())
-            log_stage(f"Resumed EMA params from {ema_dir}")
-        elif checkpoints is not None:
-            try:
-                restored_ema = checkpoints.restore_checkpoint(ema_dir, ema_params)
-                if restored_ema is not ema_params:
-                    ema_params = restored_ema
-                    log_stage(f"Resumed EMA params from {ema_dir}")
-            except Exception:
-                pass
+        ema_dir = os.path.join(resume_dir, "ema")
+        # Check for orbax EMA subdirectories (e.g. ema/checkpoint_NNNNN/)
+        ema_restored = False
+        if os.path.isdir(ema_dir):
+            ema_subdirs = sorted([
+                d for d in os.listdir(ema_dir)
+                if os.path.isdir(os.path.join(ema_dir, d))
+                and os.path.isfile(os.path.join(ema_dir, d, "_METADATA"))
+            ])
+            if ema_subdirs:
+                ema_ckpt_path = os.path.join(ema_dir, ema_subdirs[-1])
+                log_stage(f"Restoring EMA from orbax: {ema_ckpt_path}")
+                try:
+                    import orbax.checkpoint as ocp
+                    ema_checkpointer = ocp.PyTreeCheckpointer()
+                    # Load without template to avoid key mismatch
+                    raw_ema = ema_checkpointer.restore(ema_ckpt_path)
+                    # The model uses nn.remat(DiTBlock) which Flax names as
+                    # 'CheckpointDiTBlock_*'. The raw checkpoint may use either
+                    # 'DiTBlock_*' or 'CheckpointDiTBlock_*' depending on how
+                    # it was saved. Align keys with the model's expected names.
+                    model_param_keys = set(state.params.keys()) if hasattr(state.params, 'keys') else set()
+                    def _align_keys(d):
+                        if not isinstance(d, dict):
+                            return d
+                        new_d = {}
+                        for k, v in d.items():
+                            new_key = k
+                            # If model expects CheckpointDiTBlock_* but ckpt has DiTBlock_*
+                            if k.startswith("DiTBlock_") and f"Checkpoint{k}" in model_param_keys:
+                                new_key = f"Checkpoint{k}"
+                            # If model expects DiTBlock_* but ckpt has CheckpointDiTBlock_*
+                            elif k.startswith("CheckpointDiTBlock_"):
+                                plain_key = k.replace("CheckpointDiTBlock_", "DiTBlock_")
+                                if plain_key in model_param_keys:
+                                    new_key = plain_key
+                            new_d[new_key] = _align_keys(v)
+                        return new_d
+                    ema_params = _align_keys(raw_ema)
+                    log_stage(f"Resumed EMA params from {ema_ckpt_path}")
+                    ema_restored = True
+                except Exception as e:
+                    log_stage(f"Orbax EMA restore failed: {e}")
+
+        if not ema_restored:
+            # Fallback: try msgpack EMA
+            ema_msgpack = sorted(glob.glob(os.path.join(ema_dir, "checkpoint_*.msgpack")))
+            if ema_msgpack:
+                with open(ema_msgpack[-1], "rb") as f:
+                    ema_params = flax.serialization.from_bytes(ema_params, f.read())
+                log_stage(f"Resumed EMA params from msgpack in {ema_dir}")
+            elif checkpoints is not None:
+                try:
+                    restored_ema = checkpoints.restore_checkpoint(ema_dir, ema_params)
+                    if restored_ema is not ema_params:
+                        ema_params = restored_ema
+                        log_stage(f"Resumed EMA params from {ema_dir}")
+                except Exception:
+                    pass
 
         if resumed_step == 0:
             log_stage("No checkpoint found, starting fresh.")
 
+        # ── Harmonize num_classes between config, params, and EMA ─────────────
+        # The main checkpoint and EMA may have been saved with different num_classes.
+        # Detect actual num_classes from restored main params and update config.
+        try:
+            main_emb = state.params['LabelEmbedder_0']['Embed_0']['embedding']
+            actual_num_classes = main_emb.shape[0]
+            log_stage(f"Main params embedding shape: {main_emb.shape}, config num_classes={config['num_classes']}")
+            if actual_num_classes != config['num_classes']:
+                log_stage(f"Auto-detected num_classes={actual_num_classes} from restored params "
+                          f"(config had {config['num_classes']}). Updating config.")
+                config['num_classes'] = actual_num_classes
+        except (KeyError, AttributeError) as e:
+            log_stage(f"Could not detect num_classes from main params: {e}")
+
+        # Truncate/pad EMA embedding to match main params if shapes differ
+        try:
+            ema_emb = ema_params['LabelEmbedder_0']['Embed_0']['embedding']
+            expected = config['num_classes']
+            log_stage(f"EMA embedding shape: {ema_emb.shape}, expected num_classes={expected}")
+            if ema_emb.shape[0] != expected:
+                log_stage(f"EMA embedding has {ema_emb.shape[0]} classes, "
+                          f"truncating to {expected} to match main params.")
+                ema_params['LabelEmbedder_0']['Embed_0']['embedding'] = ema_emb[:expected]
+            else:
+                log_stage("EMA embedding shape matches config. No truncation needed.")
+        except (KeyError, AttributeError, TypeError) as e:
+            log_stage(f"Could not harmonize EMA embedding: {e}")
+
+    # ── Move from CPU → TPU (replicate across devices) ────────────────────────
+    # Cast EMA to bfloat16 to save ~2.7GB HBM per device
+    ema_params = jax.tree_util.tree_map(
+        lambda x: x.astype(jnp.bfloat16) if hasattr(x, 'dtype') and x.dtype == jnp.float32 else x,
+        ema_params,
+    )
+    import gc; gc.collect()
+    log_stage("Moving model state from CPU to TPU devices...")
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
     ema_decay_rep = jax_utils.replicate(jnp.float32(args.ema_decay))
+    log_stage("TPU replicate done.")
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
@@ -2033,34 +2148,60 @@ def main():
             return
 
     # ── Checkpoint helpers ─────────────────────────────────────────────────────
-    def _save_ckpt(ckpt_dir, target, step):
-        os.makedirs(ckpt_dir, exist_ok=True)
-        if checkpoints is not None:
-            checkpoints.save_checkpoint(
-                ckpt_dir=ckpt_dir, target=target, step=step,
-                keep=args.ckpt_keep, overwrite=True,
-            )
-        else:
-            import flax.serialization
-            ckpt_path = os.path.join(ckpt_dir, f"checkpoint_{step}.msgpack")
-            with open(ckpt_path, "wb") as f:
-                f.write(flax.serialization.to_bytes(target))
-            existing = sorted(glob.glob(os.path.join(ckpt_dir, "checkpoint_*.msgpack")))
-            while len(existing) > args.ckpt_keep:
-                os.remove(existing.pop(0))
-
     def _save_ckpt_full(state, ema_params, step, args):
-        """Save full training state (params + optimizer + step) and EMA params."""
+        """Save full training state and EMA params in native Orbax format.
+
+        Structure (mirrors the resume checkpoint):
+          <ckpt_dir>/
+            _METADATA, _sharding, d/, ocdbt.process_0/ ...  (main: params + opt_state + step)
+            ema/
+              checkpoint_<step>/
+                _METADATA, _sharding, d/, ...                (ema params)
+        """
+        import orbax.checkpoint as ocp
+
         unrep_state = jax_utils.unreplicate(state)
         unrep_ema = jax_utils.unreplicate(ema_params)
+
+        ckpt_dir = args.ckpt_dir
+        ema_sub = os.path.join(ckpt_dir, "ema")
+
+        # ── Clean up old checkpoints (keep=1: remove everything before saving) ──
+        # Remove old main checkpoint files (Orbax artifacts)
+        if os.path.isdir(ckpt_dir):
+            for entry in os.listdir(ckpt_dir):
+                full = os.path.join(ckpt_dir, entry)
+                if entry == "ema":
+                    continue  # handled separately
+                if os.path.isdir(full):
+                    import shutil; shutil.rmtree(full, ignore_errors=True)
+                else:
+                    try:
+                        os.remove(full)
+                    except OSError:
+                        pass
+        # Remove old EMA sub-checkpoints
+        if os.path.isdir(ema_sub):
+            import shutil; shutil.rmtree(ema_sub, ignore_errors=True)
+
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+        # ── Save main checkpoint (params + opt_state + step) ──
         train_ckpt = {
             'params': unrep_state.params,
             'opt_state': unrep_state.opt_state,
             'step': step,
         }
-        _save_ckpt(args.ckpt_dir, train_ckpt, step)
-        _save_ckpt(os.path.join(args.ckpt_dir, "ema"), unrep_ema, step)
-        log_stage(f"Checkpoint saved at step {step}")
+        main_checkpointer = ocp.PyTreeCheckpointer()
+        main_checkpointer.save(ckpt_dir, train_ckpt, force=True)
+        log_stage(f"Saved main checkpoint at step {step} → {ckpt_dir}")
+
+        # ── Save EMA params in sub-directory (matches resume format) ──
+        ema_ckpt_dir = os.path.join(ema_sub, f"checkpoint_{step}")
+        os.makedirs(ema_ckpt_dir, exist_ok=True)
+        ema_checkpointer = ocp.PyTreeCheckpointer()
+        ema_checkpointer.save(ema_ckpt_dir, unrep_ema, force=True)
+        log_stage(f"Saved EMA checkpoint at step {step} → {ema_ckpt_dir}")
 
     # ── Training loop ─────────────────────────────────────────────────────────
     global_step = resumed_step

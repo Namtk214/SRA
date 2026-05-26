@@ -1,0 +1,19 @@
+2026-05-26 12:43:39,868 INFO    MainThread:2236283 [wandb_setup.py:_flush():81] Current SDK version is 0.26.1
+2026-05-26 12:43:39,868 INFO    MainThread:2236283 [wandb_setup.py:_flush():81] Configure stats pid to 2236283
+2026-05-26 12:43:39,868 INFO    MainThread:2236283 [wandb_setup.py:_flush():81] Loading settings from environment variables
+2026-05-26 12:43:39,868 INFO    MainThread:2236283 [wandb_init.py:setup_run_log_directory():723] Logging user logs to /home/nam_ngothanh05/SRA/wandb/run-20260526_124339-pt4sbx3e/logs/debug.log
+2026-05-26 12:43:39,868 INFO    MainThread:2236283 [wandb_init.py:setup_run_log_directory():724] Logging internal logs to /home/nam_ngothanh05/SRA/wandb/run-20260526_124339-pt4sbx3e/logs/debug-internal.log
+2026-05-26 12:43:39,868 INFO    MainThread:2236283 [wandb_init.py:init():850] calling init triggers
+2026-05-26 12:43:39,868 INFO    MainThread:2236283 [wandb_init.py:init():855] wandb.init called with sweep_config: {}
+config: {'batch_size': 256, 'grad_accum_steps': 1, 'model_size': 'XL', 'epochs': 400, 'steps_per_epoch': 5000, 'learning_rate': 0.0001, 'ckpt_dir': '/home/nam_ngothanh05/checkpoints/sit-xl', 'ckpt_freq': 5000, 'ckpt_keep': 1, 'resume': True, 'resume_ckpt': None, 'data_path': '/home/nam_ngothanh05/gcs_mount/imagenet-latent-vae-encode/train-*.ar', 'val_data_path': '/home/nam_ngothanh05/gcs_mount/imagenet-latent-vae-encode/val-*.ar', 'wandb_project': 'selfflow-jax', 'no_wandb': False, 'ema_decay': 0.9999, 'grad_clip': 1.0, 'cfg_prob': 0.1, 'vae_model': '/home/nam_ngothanh05/models/vae', 'vae_hf_config': '/kaggle/working/huggingface_cache/hub/models--stabilityai--sd-vae-ft-ema/snapshots/f04b2c4b98319346dad8c65879f680b1997b204a/config.json', 'log_freq': 20, 'eval_freq': 5000, 'eval_batches': 4, 'sample_freq': 5000, 'sample_num_steps': 50, 'sample_cfg_scale': 1.0, 'fid_freq': 50000, 'num_fid_samples': 50000, 'fid_batch_size': 32, 'fid_eval_local_batch': 4, 'inception_score': True, 'inception_score_weights': '/home/nam_ngothanh05/models/inception/inception_v3_google-0cc3c7bd.pth', 'inception_score_splits': 10, 'precision_recall': True, 'pr_k': 3, 'pr_max_samples': 5000, 'pr_full_mode': False, 'linear_probe': False, 'probe_save_path': None, 'probe_layer': None, 'probe_eval_batches': 4, 'block_corr_freq': 0, 'block_corr_batches': 2, 'fid_num_steps': 250, 'fid_cfg_scale': 1.0, 'vae_decode_batch_size': 8, 'preflight_checks': False, 'preflight_only': False, 'preflight_sample_count': 4, 'preflight_fid_samples': 16, 'preflight_fid_memory_probe': False, 'mock_data': False, '_wandb': {}}
+2026-05-26 12:43:39,868 INFO    MainThread:2236283 [wandb_init.py:init():898] starting backend
+2026-05-26 12:43:40,089 INFO    MainThread:2236283 [wandb_init.py:init():913] sending inform_init request
+2026-05-26 12:43:40,383 INFO    MainThread:2236283 [wandb_init.py:init():918] backend started and connected
+2026-05-26 12:43:40,386 INFO    MainThread:2236283 [wandb_init.py:init():988] updated telemetry
+2026-05-26 12:43:40,395 INFO    MainThread:2236283 [wandb_init.py:init():1011] communicating run to backend with 90.0 second timeout
+2026-05-26 12:43:40,569 INFO    MainThread:2236283 [wandb_init.py:init():1056] starting run threads in backend
+2026-05-26 12:43:40,722 INFO    MainThread:2236283 [wandb_run.py:_console_start():2554] atexit reg
+2026-05-26 12:43:40,723 INFO    MainThread:2236283 [wandb_run.py:_redirect():2403] redirect: wrap_raw
+2026-05-26 12:43:40,723 INFO    MainThread:2236283 [wandb_run.py:_redirect():2472] Wrapping output streams.
+2026-05-26 12:43:40,723 INFO    MainThread:2236283 [wandb_run.py:_redirect():2495] Redirects installed.
+2026-05-26 12:43:40,728 INFO    MainThread:2236283 [wandb_init.py:init():1094] run started, returning control to user process

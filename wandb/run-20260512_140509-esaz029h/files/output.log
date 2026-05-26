@@ -1,0 +1,50 @@
+Exception ignored in: <function _xla_gc_callback at 0x7f55f6c427a0>
+Traceback (most recent call last):
+  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/jax/_src/lib/__init__.py", line 118, in _xla_gc_callback
+    def _xla_gc_callback(*args):
+KeyboardInterrupt:
+ERROR:absl:Processing Failed. Shutting down.
+Traceback (most recent call last):
+  File "/home/nam_ngothanh05/SRA/train.py", line 2207, in <module>
+    main()
+  File "/home/nam_ngothanh05/SRA/train.py", line 2081, in main
+    batch = next(data_iterator)
+  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/data_loader.py", line 556, in __next__
+    return next(self._iterator)
+  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/data_loader.py", line 257, in __next__
+    return next(self._parent)
+  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/dataset/stats.py", line 334, in wrapper
+    result = next_fn(iterator)
+  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/dataset/transformations/prefetch.py", line 682, in __next__
+    result, state = next(self._iterator)
+  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/dataset/transformations/prefetch.py", line 311, in _iterator_with_context
+    yield from it
+  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/grain_pool.py", line 816, in __next__
+    raise element
+  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/grain_pool.py", line 640, in _process_elements_in_grain_pool
+    for element in g_pool:
+  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/grain_pool.py", line 518, in __next__
+    raise remote_error.original_error
+KeyError: 'Grain worker 5 failed with the following error:\n\nTraceback (most recent call last):\n  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/grain_pool.py", line 262, in _worker_loop\n    next_element = next(element_producer)\n  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/dataset/transformations/prefetch.py", line 560, in __call__\n    for element in it:\n  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/dataset/stats.py", line 334, in wrapper\n    result = next_fn(iterator)\n  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/dataset/transformations/map.py", line 215, in __next__\n    element = next(self._parent)\n  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/data_loader.py", line 203, in __next__\n    return next(self._iterator)\n  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/operations.py", line 155, in __call__\n    for input_record in input_iterator:\n  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/dataset/stats.py", line 334, in wrapper\n    result = next_fn(iterator)\n  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/dataset/transformations/map.py", line 218, in __next__\n    element = self._map_fn(element)\n  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/data_loader.py", line 658, in <lambda>\n    lambda r: record.Record(metadata=r.metadata, data=transform.map(r.data))\n  File "/home/nam_ngothanh05/SRA/train.py", line 657, in map\n    latent = parsed["latent"] # numpy array shape: (4, 32, 32)\nKeyError: \'latent\'\n'
+Traceback (most recent call last):
+  File "/home/nam_ngothanh05/SRA/train.py", line 2207, in <module>
+    main()
+  File "/home/nam_ngothanh05/SRA/train.py", line 2081, in main
+    batch = next(data_iterator)
+  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/data_loader.py", line 556, in __next__
+    return next(self._iterator)
+  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/data_loader.py", line 257, in __next__
+    return next(self._parent)
+  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/dataset/stats.py", line 334, in wrapper
+    result = next_fn(iterator)
+  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/dataset/transformations/prefetch.py", line 682, in __next__
+    result, state = next(self._iterator)
+  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/dataset/transformations/prefetch.py", line 311, in _iterator_with_context
+    yield from it
+  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/grain_pool.py", line 816, in __next__
+    raise element
+  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/grain_pool.py", line 640, in _process_elements_in_grain_pool
+    for element in g_pool:
+  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/grain_pool.py", line 518, in __next__
+    raise remote_error.original_error
+KeyError: 'Grain worker 5 failed with the following error:\n\nTraceback (most recent call last):\n  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/grain_pool.py", line 262, in _worker_loop\n    next_element = next(element_producer)\n  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/dataset/transformations/prefetch.py", line 560, in __call__\n    for element in it:\n  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/dataset/stats.py", line 334, in wrapper\n    result = next_fn(iterator)\n  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/dataset/transformations/map.py", line 215, in __next__\n    element = next(self._parent)\n  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/data_loader.py", line 203, in __next__\n    return next(self._iterator)\n  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/operations.py", line 155, in __call__\n    for input_record in input_iterator:\n  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/dataset/stats.py", line 334, in wrapper\n    result = next_fn(iterator)\n  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/dataset/transformations/map.py", line 218, in __next__\n    element = self._map_fn(element)\n  File "/home/nam_ngothanh05/.local/lib/python3.10/site-packages/grain/_src/python/data_loader.py", line 658, in <lambda>\n    lambda r: record.Record(metadata=r.metadata, data=transform.map(r.data))\n  File "/home/nam_ngothanh05/SRA/train.py", line 657, in map\n    latent = parsed["latent"] # numpy array shape: (4, 32, 32)\nKeyError: \'latent\'\n'
